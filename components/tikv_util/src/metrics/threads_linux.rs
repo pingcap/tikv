@@ -1,14 +1,18 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::fs;
+use nix::unistd::gettid;
+use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Result};
 use std::sync::Mutex;
+use std::{fs, thread};
 
 use libc::{self, pid_t};
 use prometheus::core::{Collector, Desc};
 use prometheus::{self, proto, CounterVec, IntCounterVec, IntGaugeVec, Opts};
 
 use procinfo::pid;
+
+use super::{ThreadBuildWrapper, TokioThreadBuildWrapper};
 
 /// Monitors threads of the current process.
 pub fn monitor_threads<S: Into<String>>(namespace: S) -> Result<()> {
@@ -113,7 +117,12 @@ impl Collector for ThreadsCollector {
                 // Threads CPU time.
                 let total = cpu_total(&stat);
                 // sanitize thread name before push metrics.
-                let name = sanitize_thread_name(tid, &stat.command);
+                let name = if let Some(thread_name) = THREAD_NAME_HASHMAP.lock().unwrap().get(&tid)
+                {
+                    sanitize_thread_name(tid, thread_name)
+                } else {
+                    sanitize_thread_name(tid, &stat.command)
+                };
                 let cpu_total = metrics
                     .cpu_totals
                     .get_metric_with_label_values(&[&name, &format!("{}", tid)])
@@ -285,6 +294,61 @@ lazy_static! {
             libc::sysconf(libc::_SC_CLK_TCK) as f64
         }
     };
+    static ref THREAD_NAME_HASHMAP: Mutex<HashMap<pid_t, String>> = Mutex::new(HashMap::new());
+}
+
+fn add_thread_name_to_map() {
+    if let Some(name) = thread::current().name() {
+        let tid = pid_t::from(gettid());
+        THREAD_NAME_HASHMAP
+            .lock()
+            .unwrap()
+            .insert(tid, name.to_string());
+        debug!("tid {} thread name is {}", tid, name);
+    }
+}
+
+fn remove_thread_name_from_map() {
+    let tid = pid_t::from(gettid());
+    THREAD_NAME_HASHMAP.lock().unwrap().remove(&tid);
+}
+
+impl ThreadBuildWrapper for thread::Builder {
+    fn spawn_wrapper<F, T>(self, f: F) -> Result<thread::JoinHandle<T>>
+    where
+        F: FnOnce() -> T,
+        F: Send + 'static,
+        T: Send + 'static,
+    {
+        self.spawn(|| {
+            add_thread_name_to_map();
+            let res = f();
+            remove_thread_name_from_map();
+            res
+        })
+    }
+}
+
+impl TokioThreadBuildWrapper for tokio_threadpool::Builder {
+    fn after_start_wrapper<F>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.after_start(move || {
+            add_thread_name_to_map();
+            f();
+        })
+    }
+
+    fn before_stop_wrapper<F>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.before_stop(move || {
+            f();
+            remove_thread_name_from_map();
+        })
+    }
 }
 
 #[cfg(test)]
