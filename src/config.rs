@@ -41,7 +41,7 @@ use crate::storage::{Config as StorageConfig, DEFAULT_ROCKSDB_SUB_DIR};
 use engine::rocks::util::config::{self as rocks_config, BlobRunMode, CompressionType};
 use engine::rocks::util::{
     db_exist, CFOptions, EventListener, FixedPrefixSliceTransform, FixedSuffixSliceTransform,
-    NoopSliceTransform,
+    NoopSliceTransform, SequentialRowInsertTransform,
 };
 use engine::{CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use pd_client::Config as PdConfig;
@@ -432,6 +432,10 @@ impl DefaultCfConfig {
         });
         cf_opts.add_table_properties_collector_factory("tikv.range-properties-collector", f);
         cf_opts.set_titandb_options(&self.titan.build_opts());
+        let f = Box::new(SequentialRowInsertTransform::new(1));
+        cf_opts
+            .set_memtable_insert_hint_prefix_extractor("table-sequential-insert-default", f)
+            .unwrap();
         cf_opts
     }
 }
@@ -509,6 +513,10 @@ impl WriteCfConfig {
         });
         cf_opts.add_table_properties_collector_factory("tikv.range-properties-collector", f);
         cf_opts.set_titandb_options(&self.titan.build_opts());
+        let f = Box::new(SequentialRowInsertTransform::new(2));
+        cf_opts
+            .set_memtable_insert_hint_prefix_extractor("table-sequential-insert-write", f)
+            .unwrap();
         cf_opts
     }
 }
@@ -703,6 +711,7 @@ pub struct DbConfig {
     pub writable_file_max_buffer_size: ReadableSize,
     pub use_direct_io_for_flush_and_compaction: bool,
     pub enable_pipelined_write: bool,
+    pub allow_concurrent_memtable_write: bool,
     pub defaultcf: DefaultCfConfig,
     pub writecf: WriteCfConfig,
     pub lockcf: LockCfConfig,
@@ -739,6 +748,7 @@ impl Default for DbConfig {
             writable_file_max_buffer_size: ReadableSize::mb(1),
             use_direct_io_for_flush_and_compaction: false,
             enable_pipelined_write: true,
+            allow_concurrent_memtable_write: false,
             defaultcf: DefaultCfConfig::default(),
             writecf: WriteCfConfig::default(),
             lockcf: LockCfConfig::default(),
@@ -794,6 +804,7 @@ impl DbConfig {
             self.use_direct_io_for_flush_and_compaction,
         );
         opts.enable_pipelined_write(self.enable_pipelined_write);
+        opts.allow_concurrent_memtable_write(self.allow_concurrent_memtable_write);
         opts.add_event_listener(EventListener::new("kv"));
 
         if self.titan.enabled {
