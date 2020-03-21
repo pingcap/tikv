@@ -503,6 +503,56 @@ pub fn truncate_real(x: Real, d: i32) -> Real {
     }
 }
 
+const I64_TEN_POWS: [i64; 19] = [
+    1,
+    10,
+    100,
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+    10_000_000_000,
+    100_000_000_000,
+    1_000_000_000_000,
+    10_000_000_000_000,
+    100_000_000_000_000,
+    1_000_000_000_000_000,
+    10_000_000_000_000_000,
+    100_000_000_000_000_000,
+    1_000_000_000_000_000_000,
+];
+
+#[inline]
+#[rpn_fn]
+pub fn truncate_int_with_uint(arg0: &Option<Int>, arg1: &Option<Int>) -> Result<Option<Int>> {
+    match (arg0, arg1) {
+        (&Some(x), Some(_)) => Ok(Some(x)),
+        _ => Ok(None),
+    }
+}
+
+#[inline]
+#[rpn_fn]
+pub fn truncate_int_with_int(arg0: &Option<Int>, arg1: &Option<Int>) -> Result<Option<Int>> {
+    match (arg0, arg1) {
+        (&Some(x), &Some(d)) => {
+            if d >= 0 {
+                Ok(Some(x))
+            } else {
+                if d <= -(I64_TEN_POWS.len() as i64) {
+                    return Ok(Some(0));
+                }
+                let shift = I64_TEN_POWS[-d as usize];
+                Ok(Some(x / shift * shift))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 thread_local! {
    static MYSQL_RNG: RefCell<MySQLRng> = RefCell::new(MySQLRng::new())
 }
@@ -1506,6 +1556,37 @@ mod tests {
                 .unwrap();
 
             assert_eq!(output, Some(Real::from(expected)));
+        }
+    }
+
+    #[test]
+    fn test_truncate_int() {
+        let test_cases = vec![
+            (1028, 0, false, 1028),
+            (1028, 5, false, 1028),
+            (1028, -2, false, 1000),
+            (1028, 309, false, 1028),
+            (1028, i64::min_value(), false, 0),
+            ((1028), u64::max_value() as i64, true, 1028),
+        ];
+
+        for (lhs, rhs, rhs_is_unsigned, expected) in test_cases {
+            let rhs_field_type = FieldTypeBuilder::new()
+                .tp(FieldTypeTp::LongLong)
+                .flag(if rhs_is_unsigned {
+                    FieldTypeFlag::UNSIGNED
+                } else {
+                    FieldTypeFlag::empty()
+                })
+                .build();
+
+            let output = RpnFnScalarEvaluator::new()
+                .push_param(Some(lhs))
+                .push_param_with_field_type(Some(rhs), rhs_field_type)
+                .evaluate::<Int>(ScalarFuncSig::TruncateInt)
+                .unwrap();
+
+            assert_eq!(output, Some(expected));
         }
     }
 }
