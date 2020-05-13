@@ -3511,7 +3511,7 @@ mod tests {
             engine: engine.clone(),
             router: router.clone(),
         };
-        system.spawn("test-basic".to_owned(), builder);
+        system.spawn("test-basic".to_owned(), builder, false);
 
         let mut reg = Registration::default();
         reg.id = 1;
@@ -3888,7 +3888,7 @@ mod tests {
             engine: engine.clone(),
             router: router.clone(),
         };
-        system.spawn("test-handle-raft".to_owned(), builder);
+        system.spawn("test-handle-raft".to_owned(), builder, false);
 
         let mut reg = Registration::default();
         reg.id = 3;
@@ -4147,7 +4147,7 @@ mod tests {
             _phantom: PhantomData,
             router: router.clone(),
         };
-        system.spawn("test-handle-raft".to_owned(), builder);
+        system.spawn("test-handle-raft".to_owned(), builder, false);
 
         let mut reg = Registration::default();
         reg.id = 3;
@@ -4412,7 +4412,7 @@ mod tests {
             engine: engine.clone(),
             router: router.clone(),
         };
-        system.spawn("test-split".to_owned(), builder);
+        system.spawn("test-split".to_owned(), builder, false);
 
         router.schedule_task(1, Msg::Registration(reg.clone()));
         let enabled = Arc::new(AtomicBool::new(true));
