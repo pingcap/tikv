@@ -430,20 +430,8 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                 PeerMsg::ApplyRes { res } => {
                     self.on_apply_res(res);
                 }
-                PeerMsg::SignificantMsg(msg) => {
-                    let timer = TiInstant::now_coarse();
-                    self.on_significant_msg(msg);
-                    RAFT_EVENT_DURATION
-                        .get(RaftEventDurationType::significant_msg)
-                        .observe(duration_to_sec(timer.elapsed()) as f64);
-                }
-                PeerMsg::CasualMessage(msg) => {
-                    let timer = TiInstant::now_coarse();
-                    self.on_casual_msg(msg);
-                    RAFT_EVENT_DURATION
-                        .get(RaftEventDurationType::causal_msg)
-                        .observe(duration_to_sec(timer.elapsed()) as f64);
-                }
+                PeerMsg::SignificantMsg(msg) => self.on_significant_msg(msg),
+                PeerMsg::CasualMessage(msg) => self.on_casual_msg(msg),
                 PeerMsg::Start => self.start(),
                 PeerMsg::HeartbeatPd => {
                     if self.fsm.peer.is_leader() {
@@ -515,7 +503,11 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                 self.on_schedule_half_split_region(&region_epoch, policy);
             }
             CasualMessage::GcSnap { snaps } => {
+                let timer = TiInstant::now_coarse();
                 self.on_gc_snap(snaps);
+                RAFT_EVENT_DURATION
+                    .get(RaftEventDurationType::peer_gc_snap)
+                    .observe(duration_to_sec(timer.elapsed()) as f64);
             }
             CasualMessage::ClearRegionSize => {
                 self.on_clear_region_size();
@@ -729,7 +721,11 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                 target,
                 result,
             } => {
+                let timer = TiInstant::now_coarse();
                 self.on_merge_result(target_region_id, target, result);
+                RAFT_EVENT_DURATION
+                    .get(RaftEventDurationType::merge_result)
+                    .observe(duration_to_sec(timer.elapsed()) as f64);
             }
             SignificantMsg::CatchUpLogs(catch_up_logs) => {
                 self.on_catch_up_logs_for_merge(catch_up_logs);

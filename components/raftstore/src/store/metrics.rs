@@ -129,10 +129,10 @@ make_auto_flush_static_metric! {
         consistency_check,
         cleanup_import_sst,
         peer_msg,
-        causal_msg,
-        significant_msg,
         destroy_peer,
         split_region,
+        peer_gc_snap,
+        merge_result,
     }
 
     pub struct RaftEventDuration : LocalHistogram {
