@@ -277,6 +277,7 @@ pub struct Peer {
     /// Send to these peers to check whether itself is stale.
     pub check_stale_conf_ver: u64,
     pub check_stale_peers: Vec<metapb::Peer>,
+    pub stash_committed_entries: Vec<eraftpb::Entry>,
 }
 
 impl Peer {
@@ -360,6 +361,7 @@ impl Peer {
             replication_sync: false,
             check_stale_conf_ver: 0,
             check_stale_peers: vec![],
+            stash_committed_entries: vec![],
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -1417,6 +1419,7 @@ impl Peer {
                 );
                 self.peer = peer;
             };
+            self.stash_committed_entries.clear();
         }
 
         if !self.is_leader() {
@@ -1458,7 +1461,36 @@ impl Peer {
         // in `ready.committed_entries` again, which will lead to inconsistency.
         if ready.snapshot().is_empty() {
             debug_assert!(!invoke_ctx.has_snapshot() && !self.get_store().is_applying_snapshot());
-            let committed_entries = ready.committed_entries.take().unwrap();
+
+            let committed_entries = if ctx.cfg.delay_follower_apply {
+                if self.is_leader() || ctx.sync_log {
+                    if self.stash_committed_entries.len() != 0 {
+                        let mut e = self.stash_committed_entries.drain(..).collect::<Vec<_>>();
+                        if let Some(mut o) = ready.committed_entries.take() {
+                            e.append(&mut o);
+                        }
+                        e
+                    } else {
+                        ready.committed_entries.take().unwrap()
+                    }
+                } else {
+                    if ready.committed_entries.as_ref().map(|s| s.len()).unwrap() != 0 {
+                        let mut o = ready.committed_entries.take().unwrap();
+                        if self.stash_committed_entries.len() + o.len() > ctx.cfg.delay_count as usize {
+                            let mut e = self.stash_committed_entries.drain(..).collect::<Vec<_>>();
+                            e.append(&mut o);
+                            e
+                        } else {
+                            self.stash_committed_entries.append(&mut o);
+                            self.last_applying_idx = self.stash_committed_entries.last().unwrap().get_index();
+                            vec![]
+                        }
+                    } else {
+                        ready.committed_entries.take().unwrap()
+                    }
+                }
+            } else { ready.committed_entries.take().unwrap() };
+
             // leader needs to update lease and last committed split index.
             let mut lease_to_be_updated = self.is_leader();
             for entry in committed_entries.iter().rev() {
