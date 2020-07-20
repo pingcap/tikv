@@ -469,9 +469,7 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
     }
 
     fn on_update_replication_mode(&mut self) {
-        self.fsm
-            .peer
-            .switch_replication_mode(&self.ctx.global_replication_state);
+        self.fsm.peer.switch_replication_mode(&self.ctx);
         if self.fsm.peer.is_leader() {
             self.reset_raft_tick(GroupState::Ordered);
             self.register_pd_heartbeat_tick();
@@ -1008,6 +1006,16 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
         }
 
         self.fsm.peer.mut_store().flush_cache_metrics();
+
+        if self.fsm.peer.need_check_delay_switch() {
+            let res = self
+                .fsm
+                .peer
+                .check_group_commit_consistent(self.ctx.cfg.group_consistent_log_gap);
+            self.fsm
+                .peer
+                .check_wait_sync_deadline(res.unwrap_or(false), self.ctx.get_current_time());
+        }
 
         // Keep ticking if there are still pending read requests or this node is within hibernate timeout.
         if res.is_none() /* hibernate_region is false */ ||

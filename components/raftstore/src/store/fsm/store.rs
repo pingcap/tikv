@@ -20,6 +20,7 @@ use kvproto::raft_serverpb::{ExtraMessageType, PeerState, RaftMessage, RegionLoc
 use kvproto::replication_modepb::{ReplicationMode, ReplicationStatus};
 use protobuf::Message;
 use raft::{Ready, StateRole};
+use std::cell::RefCell;
 use std::cmp::{Ord, Ordering as CmpOrdering};
 use std::collections::BTreeMap;
 use std::collections::Bound::{Excluded, Included, Unbounded};
@@ -70,7 +71,7 @@ use sst_importer::SSTImporter;
 use tikv_util::collections::HashMap;
 use tikv_util::config::{Tracker, VersionTrack};
 use tikv_util::mpsc::{self, LooseBoundedSender, Receiver};
-use tikv_util::time::{duration_to_sec, Instant as TiInstant};
+use tikv_util::time::{duration_to_sec, monotonic_raw_now, Instant as TiInstant};
 use tikv_util::timer::SteadyTimer;
 use tikv_util::worker::{FutureScheduler, FutureWorker, Scheduler, Worker};
 use tikv_util::{is_zero_duration, sys as sys_util, Either, RingQueue};
@@ -267,7 +268,7 @@ pub struct PollContext<T, C: 'static> {
     pub has_ready: bool,
     pub ready_res: Vec<(Ready, InvokeContext)>,
     pub need_flush_trans: bool,
-    pub current_time: Option<Timespec>,
+    pub current_time: RefCell<Option<Timespec>>,
     pub perf_context_statistics: PerfContextStatistics,
     pub node_start_time: Option<Instant>,
 }
@@ -316,6 +317,14 @@ impl<T, C> PollContext<T, C> {
             self.node_start_time = None;
         }
         timeout
+    }
+
+    pub fn get_current_time(&self) -> Timespec {
+        if let Some(t) = *self.current_time.borrow() {
+            return t;
+        }
+        self.current_time.borrow_mut().replace(monotonic_raw_now());
+        self.current_time.borrow().unwrap()
     }
 }
 
@@ -746,7 +755,7 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksSnapshot>, StoreFsm> fo
         if self.poll_ctx.has_ready {
             self.handle_raft_ready(peers);
         }
-        self.poll_ctx.current_time = None;
+        *self.poll_ctx.current_time.borrow_mut() = None;
         self.poll_ctx
             .raft_metrics
             .process_ready
@@ -995,7 +1004,7 @@ where
             has_ready: false,
             ready_res: Vec::new(),
             need_flush_trans: false,
-            current_time: None,
+            current_time: RefCell::new(None),
             perf_context_statistics: PerfContextStatistics::new(self.cfg.value().perf_level),
             node_start_time: Some(Instant::now()),
         };
