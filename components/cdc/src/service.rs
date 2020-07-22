@@ -6,6 +6,10 @@ use std::sync::Arc;
 
 use futures::{stream, Future, Sink, Stream};
 use grpcio::*;
+#[cfg(feature = "prost-codec")]
+use kvproto::cdcpb::change_data_request::NotifyTxnStatus;
+#[cfg(not(feature = "prost-codec"))]
+use kvproto::cdcpb::ChangeDataRequestNotifyTxnStatus as NotifyTxnStatus;
 use kvproto::cdcpb::{ChangeData, ChangeDataEvent, ChangeDataRequest, Event};
 use security::{check_common_name, SecurityManager};
 use tikv_util::collections::HashMap;
@@ -104,6 +108,24 @@ impl Service {
             security_mgr,
         }
     }
+
+    #[cfg(feature = "prost-codec")]
+    fn get_notify_txn_status_req(req: &mut ChangeDataRequest) -> Option<NotifyTxnStatus> {
+        use kvproto::cdcpb::change_data_request::Request;
+        match req.request.take() {
+            Some(Request::NotifyTxnStatus(res)) => Some(res),
+            _ => None,
+        }
+    }
+
+    #[cfg(not(feature = "prost-codec"))]
+    fn get_notify_txn_status_req(req: &mut ChangeDataRequest) -> Option<NotifyTxnStatus> {
+        if req.has_notify_txn_status() {
+            Some(req.take_notify_txn_status())
+        } else {
+            None
+        }
+    }
 }
 
 impl ChangeData for Service {
@@ -135,22 +157,31 @@ impl ChangeData for Service {
 
         let peer = ctx.peer();
         let scheduler = self.scheduler.clone();
-        let recv_req = stream.for_each(move |request| {
+        let recv_req = stream.for_each(move |mut request| {
             let region_epoch = request.get_region_epoch().clone();
             let req_id = request.get_request_id();
-            let downstream = Downstream::new(peer.clone(), region_epoch, req_id, conn_id);
-            scheduler
-                .schedule(Task::Register {
+            let region_id = request.get_region_id();
+
+            let task = if let Some(mut s) = Self::get_notify_txn_status_req(&mut request) {
+                Task::NotifyTxnStatus {
+                    region_id,
+                    txn_status: s.take_txn_status().into(),
+                }
+            } else {
+                let downstream = Downstream::new(peer.clone(), region_epoch, req_id, conn_id);
+                Task::Register {
                     request,
                     downstream,
                     conn_id,
-                })
-                .map_err(|e| {
-                    Error::RpcFailure(RpcStatus::new(
-                        RpcStatusCode::INVALID_ARGUMENT,
-                        Some(format!("{:?}", e)),
-                    ))
-                })
+                }
+            };
+
+            scheduler.schedule(task).map_err(|e| {
+                Error::RpcFailure(RpcStatus::new(
+                    RpcStatusCode::INVALID_ARGUMENT,
+                    Some(format!("{:?}", e)),
+                ))
+            })
         });
 
         let rx = BatchReceiver::new(rx, CDC_MSG_MAX_BATCH_SIZE, Vec::new, VecCollector);

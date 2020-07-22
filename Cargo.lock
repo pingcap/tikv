@@ -468,6 +468,7 @@ dependencies = [
  "prometheus",
  "raft",
  "raftstore",
+ "rand",
  "resolved_ts",
  "security",
  "slog",
@@ -1848,7 +1849,7 @@ dependencies = [
 [[package]]
 name = "kvproto"
 version = "0.0.2"
-source = "git+https://github.com/pingcap/kvproto.git#1e0910aabe6cffc721689606d88c8117d837d3cb"
+source = "git+https://github.com/MyonKeminta/kvproto.git?branch=m/cdc-aware-min-commit-ts#084221ee4336b5d814e12f767be6c3ae4f452a71"
 dependencies = [
  "futures 0.1.29",
  "grpcio",

@@ -3,20 +3,21 @@
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(feature = "prost-codec")]
 use kvproto::cdcpb::{
     error::DuplicateRequest as ErrorDuplicateRequest,
     event::{
         row::OpType as EventRowOpType, Entries as EventEntries, Event as Event_oneof_event,
-        LogType as EventLogType, Row as EventRow,
+        LogType as EventLogType, LongTxn as EventLongTxn, Row as EventRow,
     },
-    Error as EventError, Event,
+    Error as EventError, Event, TxnInfo, TxnStatus,
 };
 #[cfg(not(feature = "prost-codec"))]
 use kvproto::cdcpb::{
-    Error as EventError, ErrorDuplicateRequest, Event, EventEntries, EventLogType, EventRow,
-    EventRowOpType, Event_oneof_event,
+    Error as EventError, ErrorDuplicateRequest, Event, EventEntries, EventLogType, EventLongTxn,
+    EventRow, EventRowOpType, Event_oneof_event, TxnInfo, TxnStatus,
 };
 use kvproto::errorpb;
 
@@ -199,12 +200,34 @@ enum PendingLock {
     Track {
         key: Vec<u8>,
         start_ts: TimeStamp,
+        min_commit_ts: TimeStamp,
+        primary: Vec<u8>,
     },
     Untrack {
         key: Vec<u8>,
         start_ts: TimeStamp,
         commit_ts: Option<TimeStamp>,
     },
+}
+
+pub struct ReportLocksCfg {
+    pub report_locks_threshold: Duration,
+    pub report_locks_limit: Duration,
+}
+
+impl ReportLocksCfg {
+    fn new(report_locks_threshold: Duration, report_locks_limit: Duration) -> Self {
+        Self {
+            report_locks_threshold,
+            report_locks_limit,
+        }
+    }
+}
+
+impl Default for ReportLocksCfg {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(5), Duration::from_secs(3))
+    }
 }
 
 /// A CDC delegate of a raftstore region peer.
@@ -220,11 +243,12 @@ pub struct Delegate {
     pending: Option<Pending>,
     enabled: Arc<AtomicBool>,
     failed: bool,
+    report_locks_cfg: Option<ReportLocksCfg>,
 }
 
 impl Delegate {
     /// Create a Delegate the given region.
-    pub fn new(region_id: u64) -> Delegate {
+    pub fn new(region_id: u64, report_locks_cfg: Option<ReportLocksCfg>) -> Delegate {
         Delegate {
             region_id,
             id: ObserveID::new(),
@@ -234,6 +258,7 @@ impl Delegate {
             pending: Some(Pending::default()),
             enabled: Arc::new(AtomicBool::new(true)),
             failed: false,
+            report_locks_cfg,
         }
     }
 
@@ -374,6 +399,13 @@ impl Delegate {
             .sink_event(change_data_event, size);
     }
 
+    fn notify_one(&self, change_data_event: Event, size: usize) {
+        let downstreams = self.downstreams();
+        let index = rand::random::<usize>() % downstreams.len();
+        let downstream = &downstreams[index];
+        downstream.sink_event(change_data_event, size);
+    }
+
     /// Install a resolver and return pending downstreams.
     pub fn on_region_ready(&mut self, mut resolver: Resolver, region: Region) -> Vec<Downstream> {
         assert!(
@@ -386,7 +418,12 @@ impl Delegate {
         let mut pending = self.pending.take().unwrap();
         for lock in pending.take_locks() {
             match lock {
-                PendingLock::Track { key, start_ts } => resolver.track_lock(start_ts, key),
+                PendingLock::Track {
+                    key,
+                    start_ts,
+                    min_commit_ts,
+                    primary,
+                } => resolver.track_lock(start_ts, min_commit_ts, key, primary),
                 PendingLock::Untrack {
                     key,
                     start_ts,
@@ -418,9 +455,74 @@ impl Delegate {
         change_data_event.region_id = self.region_id;
         change_data_event.event = Some(Event_oneof_event::ResolvedTs(resolved_ts.into_inner()));
         self.broadcast(change_data_event, 0, true);
-        CDC_RESOLVED_TS_GAP_HISTOGRAM
-            .observe((min_ts.physical() - resolved_ts.physical()) as f64 / 1000f64);
+        let resolved_ts_gap = (min_ts.physical() - resolved_ts.physical()) as f64 / 1000f64;
+        CDC_RESOLVED_TS_GAP_HISTOGRAM.observe(resolved_ts_gap);
+        if let Some(cfg) = &self.report_locks_cfg {
+            if resolved_ts_gap > cfg.report_locks_threshold.as_secs_f64() {
+                let ts = min_ts.physical() - (cfg.report_locks_limit.as_millis() as u64);
+                self.report_locks(TimeStamp::compose(ts, 0));
+            }
+        }
         Some(resolved_ts)
+    }
+
+    fn report_locks(&self, filter_ts: TimeStamp) {
+        let resolver = match &self.resolver {
+            Some(r) => r,
+            None => {
+                debug!("region resolver not ready";
+                    "region_id" => self.region_id);
+                return;
+            }
+        };
+
+        let mut size = 0;
+
+        let txn = resolver
+            .txn_before_ts(filter_ts)
+            .into_iter()
+            .map(|(start_ts, primary)| {
+                size += 8 + primary.len();
+                let mut txn_info = TxnInfo::default();
+                txn_info.set_start_ts(start_ts.into_inner());
+                txn_info.set_primary(primary);
+                txn_info
+            })
+            .collect::<Vec<_>>();
+
+        info!("report long live transactions to CDC";
+            "region_id" => self.region_id,
+            "before_ts" => filter_ts,
+            "txns" => txn.len());
+        let mut event = EventLongTxn::default();
+        event.set_txn_info(txn.into());
+        let mut change_data_event = Event::default();
+        change_data_event.region_id = self.region_id;
+        change_data_event.event = Some(Event_oneof_event::LongTxn(event));
+        self.notify_one(change_data_event, size);
+    }
+
+    pub fn update_txn_status(&mut self, txn_status: Vec<TxnStatus>) {
+        let resolver = match &mut self.resolver {
+            Some(r) => r,
+            None => {
+                info!("region resolver not ready when trying to update txn status";
+                    "region_id" => self.region_id);
+                return;
+            }
+        };
+
+        info!("notify transactions to update min_commit_ts";
+            "region_id" => self.region_id,
+            "txns" => txn_status.len());
+
+        resolver.update_txn_status(
+            txn_status
+                .into_iter()
+                // Only update unfinished transactions
+                .filter(|t| t.get_min_commit_ts() > 0)
+                .map(|t| (t.get_start_ts().into(), t.get_min_commit_ts().into())),
+        );
     }
 
     pub fn on_batch(&mut self, batch: CmdBatch) -> Result<()> {
@@ -469,7 +571,8 @@ impl Delegate {
             match entry {
                 Some(TxnEntry::Prewrite { default, lock, .. }) => {
                     let mut row = EventRow::default();
-                    let skip = decode_lock(lock.0, &lock.1, &mut row);
+                    let mut parsed_lock = Lock::parse(&lock.1).unwrap();
+                    let skip = lock_to_row(lock.0, &mut parsed_lock, &mut row);
                     if skip {
                         continue;
                     }
@@ -591,7 +694,8 @@ impl Delegate {
                 }
                 "lock" => {
                     let mut row = EventRow::default();
-                    let skip = decode_lock(put.take_key(), put.get_value(), &mut row);
+                    let mut lock = Lock::parse(put.get_value()).unwrap();
+                    let skip = lock_to_row(put.take_key(), &mut lock, &mut row);
                     if skip {
                         continue;
                     }
@@ -607,15 +711,20 @@ impl Delegate {
                     // In order to compute resolved ts,
                     // we must track inflight txns.
                     match self.resolver {
-                        Some(ref mut resolver) => {
-                            resolver.track_lock(row.start_ts.into(), row.key.clone())
-                        }
+                        Some(ref mut resolver) => resolver.track_lock(
+                            row.start_ts.into(),
+                            lock.min_commit_ts,
+                            row.key.clone(),
+                            lock.primary,
+                        ),
                         None => {
                             assert!(self.pending.is_some(), "region resolver not ready");
                             let pending = self.pending.as_mut().unwrap();
                             pending.locks.push(PendingLock::Track {
                                 key: row.key.clone(),
                                 start_ts: row.start_ts.into(),
+                                min_commit_ts: TimeStamp::zero(),
+                                primary: lock.primary,
                             });
                             pending.pending_bytes += row.key.len();
                             CDC_PENDING_BYTES_GAUGE.add(row.key.len() as i64);
@@ -713,8 +822,7 @@ fn decode_write(key: Vec<u8>, value: &[u8], row: &mut EventRow) -> bool {
     false
 }
 
-fn decode_lock(key: Vec<u8>, value: &[u8], row: &mut EventRow) -> bool {
-    let lock = Lock::parse(value).unwrap();
+fn lock_to_row(key: Vec<u8>, lock: &mut Lock, row: &mut EventRow) -> bool {
     let op_type = match lock.lock_type {
         LockType::Put => EventRowOpType::Put,
         LockType::Delete => EventRowOpType::Delete,
@@ -732,7 +840,7 @@ fn decode_lock(key: Vec<u8>, value: &[u8], row: &mut EventRow) -> bool {
     row.key = key.into_raw().unwrap();
     row.op_type = op_type.into();
     set_event_row_type(row, EventLogType::Prewrite);
-    if let Some(value) = lock.short_value {
+    if let Some(value) = lock.short_value.take() {
         row.value = value;
     }
 
@@ -771,7 +879,7 @@ mod tests {
         let mut downstream =
             Downstream::new(String::new(), region_epoch, request_id, ConnID::new());
         downstream.set_sink(sink);
-        let mut delegate = Delegate::new(region_id);
+        let mut delegate = Delegate::new(region_id, None);
         delegate.subscribe(downstream);
         let enabled = delegate.enabled();
         assert!(enabled.load(Ordering::SeqCst));
@@ -898,7 +1006,7 @@ mod tests {
             Downstream::new(String::new(), region_epoch, request_id, ConnID::new());
         let downstream_id = downstream.get_id();
         downstream.set_sink(sink);
-        let mut delegate = Delegate::new(region_id);
+        let mut delegate = Delegate::new(region_id, None);
         delegate.subscribe(downstream);
         let enabled = delegate.enabled();
         assert!(enabled.load(Ordering::SeqCst));

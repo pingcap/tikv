@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::Bound::{Excluded, Unbounded};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use std::{cmp, thread};
@@ -729,7 +729,7 @@ pub struct TestPdClient {
     cluster: Arc<RwLock<Cluster>>,
     timer: Handle,
     is_incompatible: bool,
-    tso: AtomicUsize,
+    tso: AtomicU64,
     trigger_tso_failure: AtomicBool,
 }
 
@@ -740,7 +740,7 @@ impl TestPdClient {
             cluster: Arc::new(RwLock::new(Cluster::new(cluster_id))),
             timer: GLOBAL_TIMER_HANDLE.clone(),
             is_incompatible,
-            tso: AtomicUsize::new(1),
+            tso: AtomicU64::new(1),
             trigger_tso_failure: AtomicBool::new(false),
         }
     }
@@ -1067,6 +1067,11 @@ impl TestPdClient {
         self.trigger_tso_failure.store(true, Ordering::SeqCst);
     }
 
+    pub fn set_tso(&self, ts: TimeStamp) {
+        let prev = self.tso.swap(ts.into_inner(), Ordering::SeqCst);
+        assert!(prev <= ts.into_inner(), "cannot decrease tso");
+    }
+
     pub fn shutdown_store(&self, store_id: u64) {
         match self.cluster.write() {
             Ok(mut c) => {
@@ -1358,6 +1363,6 @@ impl PdClient for TestPdClient {
             )));
         }
         let tso = self.tso.fetch_add(1, Ordering::SeqCst);
-        Box::new(futures::future::result(Ok(TimeStamp::new(tso as _))))
+        Box::new(futures::future::result(Ok(tso.into())))
     }
 }
