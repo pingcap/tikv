@@ -30,7 +30,7 @@ use raft::eraftpb::{ConfChangeType, MessageType};
 use raft::{self, SnapshotStatus, INVALID_INDEX, NO_LIMIT};
 use raft::{Ready, StateRole};
 use tikv_util::mpsc::{self, LooseBoundedSender, Receiver};
-use tikv_util::time::duration_to_sec;
+use tikv_util::time::{duration_to_sec, Instant as TiInstant};
 use tikv_util::worker::{Scheduler, Stopped};
 use tikv_util::{escape, is_zero_duration};
 use txn_types::TxnExtra;
@@ -409,6 +409,7 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
     }
 
     pub fn handle_msgs(&mut self, msgs: &mut Vec<PeerMsg<RocksSnapshot>>) {
+        let timer = TiInstant::now_coarse();
         for m in msgs.drain(..) {
             match m {
                 PeerMsg::RaftMessage(msg) => {
@@ -456,6 +457,9 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
         }
         // Propose batch request which may be still waiting for more raft-command
         self.propose_batch_raft_command();
+        RAFT_EVENT_DURATION
+            .get(RaftEventDurationType::peer_msg)
+            .observe(duration_to_sec(timer.elapsed()) as f64);
     }
 
     fn propose_batch_raft_command(&mut self) {
@@ -512,7 +516,11 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                 self.on_schedule_half_split_region(&region_epoch, policy);
             }
             CasualMessage::GcSnap { snaps } => {
+                let timer = TiInstant::now_coarse();
                 self.on_gc_snap(snaps);
+                RAFT_EVENT_DURATION
+                    .get(RaftEventDurationType::peer_gc_snap)
+                    .observe(duration_to_sec(timer.elapsed()) as f64);
             }
             CasualMessage::ClearRegionSize => {
                 self.on_clear_region_size();
@@ -727,7 +735,11 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                 target,
                 result,
             } => {
+                let timer = TiInstant::now_coarse();
                 self.on_merge_result(target_region_id, target, result);
+                RAFT_EVENT_DURATION
+                    .get(RaftEventDurationType::merge_result)
+                    .observe(duration_to_sec(timer.elapsed()) as f64);
             }
             SignificantMsg::CatchUpLogs(catch_up_logs) => {
                 self.on_catch_up_logs_for_merge(catch_up_logs);
@@ -1060,7 +1072,11 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
             } => {
                 assert_eq!(peer_id, self.fsm.peer.peer_id());
                 if !merge_from_snapshot {
+                    let timer = TiInstant::now_coarse();
                     self.destroy_peer(false);
+                    RAFT_EVENT_DURATION
+                        .get(RaftEventDurationType::destroy_peer)
+                        .observe(duration_to_sec(timer.elapsed()) as f64);
                 } else {
                     // Wait for its target peer to apply snapshot and then send `MergeResult` back
                     // to destroy itself
@@ -2672,7 +2688,11 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
                     self.on_ready_compact_log(first_index, state)
                 }
                 ExecResult::SplitRegion { derived, regions } => {
-                    self.on_ready_split_region(derived, regions)
+                    let timer = TiInstant::now_coarse();
+                    self.on_ready_split_region(derived, regions);
+                    RAFT_EVENT_DURATION
+                        .get(RaftEventDurationType::split_region)
+                        .observe(duration_to_sec(timer.elapsed()) as f64);
                 }
                 ExecResult::PrepareMerge { region, state } => {
                     self.on_ready_prepare_merge(region, state)

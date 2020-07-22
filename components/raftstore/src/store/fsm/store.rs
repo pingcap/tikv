@@ -529,6 +529,7 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
         // Only enable the fail point when the store id is equal to 3, which is
         // the id of slow store in tests.
         fail_point!("on_raft_ready", self.poll_ctx.store_id() == 3, |_| {});
+        let timer = TiInstant::now_coarse();
         if self.poll_ctx.need_flush_trans
             && (!self.poll_ctx.kv_wb.is_empty() || !self.poll_ctx.raft_wb.is_empty())
         {
@@ -615,7 +616,7 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
                     .post_raft_ready_append(ready, invoke_ctx);
             }
         }
-        let dur = self.timer.elapsed();
+        let dur = timer.elapsed();
         if !self.poll_ctx.store_stat.is_busy {
             let election_timeout = Duration::from_millis(
                 self.poll_ctx.cfg.raft_base_tick_interval.as_millis()
