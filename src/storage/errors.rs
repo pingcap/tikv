@@ -12,7 +12,7 @@ use crate::storage::{
 };
 use error_code::{self, ErrorCode, ErrorCodeExt};
 use kvproto::{errorpb, kvrpcpb};
-use txn_types::{KvPair, TimeStamp};
+use txn_types::{KvPair, TimeStamp, VerKvPair};
 
 quick_error! {
     #[derive(Debug)]
@@ -346,6 +346,58 @@ pub fn extract_key_errors(res: Result<Vec<Result<()>>>) -> Vec<kvrpcpb::KeyError
             })
             .collect(),
         Err(e) => vec![extract_key_error(&e)],
+    }
+}
+
+pub fn extract_ver_error(_err: &Error) -> kvrpcpb::VerError {
+    // TODO: add match pattern for ver_error
+    let ver_error = kvrpcpb::VerError::default();
+    ver_error
+}
+
+pub fn extract_verkv_pairs(res: Result<Vec<Result<VerKvPair>>>) -> Vec<kvrpcpb::VerKvPair> {
+    match res {
+        Ok(res) => res
+            .into_iter()
+            .map(|r| match r {
+                Ok((key, value)) => {
+                    // extract version(last serialized 8 bytes as u64) from key
+                    let offset = key.len() - 8;
+                    let mut version: [u8; 8] = Default::default();
+                    version.copy_from_slice(&key[offset..offset + 8]);
+                    let mut ver_value = kvrpcpb::VerValue::default();
+                    ver_value.set_value(value);
+                    ver_value.set_version(u64::from_le_bytes(version));
+                    let mut pair = kvrpcpb::VerKvPair::default();
+                    pair.set_key(key);
+                    pair.set_value(ver_value);
+                    pair
+                }
+                Err(e) => {
+                    let mut pair = kvrpcpb::VerKvPair::default();
+                    pair.set_error(extract_ver_error(&e));
+                    pair
+                }
+            })
+            .collect(),
+        Err(e) => {
+            let mut pair = kvrpcpb::VerKvPair::default();
+            pair.set_error(extract_ver_error(&e));
+            vec![pair]
+        }
+    }
+}
+
+pub fn extract_ver_errors(res: Result<Vec<Result<()>>>) -> Vec<kvrpcpb::VerError> {
+    match res {
+        Ok(res) => res
+            .into_iter()
+            .filter_map(|x| match x {
+                Err(e) => Some(extract_ver_error(&e)),
+                Ok(_) => None,
+            })
+            .collect(),
+        Err(e) => vec![extract_ver_error(&e)],
     }
 }
 
