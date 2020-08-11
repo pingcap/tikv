@@ -2072,6 +2072,9 @@ where
             return Some("non voter");
         }
 
+        let mut voters_has_log_gap = false;
+        let last_index = self.get_store().last_index();
+
         for (id, progress) in progress.voters() {
             if progress.state == ProgressState::Snapshot {
                 return Some("pending snapshot");
@@ -2083,6 +2086,10 @@ where
                 // useful during rolling restart.
                 index = progress.matched;
             }
+            // check voter index
+            if last_index >= progress.matched + ctx.cfg.leader_transfer_max_log_lag {
+                voters_has_log_gap = true;
+            }
         }
 
         if self.raft_group.raft.has_pending_conf()
@@ -2091,8 +2098,8 @@ where
             return Some("pending conf change");
         }
 
-        let last_index = self.get_store().last_index();
-        if last_index >= index + ctx.cfg.leader_transfer_max_log_lag {
+        // check transferee index
+        if last_index >= index + ctx.cfg.leader_transfer_max_log_lag || voters_has_log_gap {
             return Some("log gap");
         }
         None
