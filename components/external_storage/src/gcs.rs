@@ -124,6 +124,8 @@ impl RetryError for RequestError {
     }
 
     fn is_retryable(&self) -> bool {
+        use std::error::Error;
+
         match self {
             // FIXME: Inspect the error source?
             Self::Hyper(e) => {
@@ -131,6 +133,7 @@ impl RetryError for RequestError {
                     || e.is_connect()
                     || e.is_incomplete_message()
                     || e.is_body_write_aborted()
+                    || e.source().map_or(false, |s| s.is::<io::Error>())
             }
             // See https://cloud.google.com/storage/docs/exponential-backoff.
             Self::OAuth(tame_oauth::Error::HttpStatus(StatusCode::TOO_MANY_REQUESTS)) => true,
