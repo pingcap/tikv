@@ -4,11 +4,13 @@ mod binary;
 mod utf8mb4_binary;
 mod utf8mb4_general_ci;
 mod utf8mb4_unicode_ci;
+mod utf8mb4_zh_pinyin_tidb_as_cs;
 
 pub use binary::*;
 pub use utf8mb4_binary::*;
 pub use utf8mb4_general_ci::*;
 pub use utf8mb4_unicode_ci::*;
+pub use utf8mb4_zh_pinyin_tidb_as_cs::*;
 
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
@@ -40,13 +42,15 @@ mod tests {
             (Collation::Utf8Mb4BinNoPadding, 1),
             (Collation::Utf8Mb4GeneralCi, 2),
             (Collation::Utf8Mb4UnicodeCi, 3),
+            (Collation::Utf8Mb4ZhPinyinAsCs, 4),
         ];
         let cases = vec![
-            // (sa, sb, [Utf8Mb4Bin, Utf8Mb4BinNoPadding, Utf8Mb4GeneralCi, Utf8Mb4UnicodeCi])
+            // (sa, sb, [Utf8Mb4Bin, Utf8Mb4BinNoPadding, Utf8Mb4GeneralCi, Utf8Mb4UnicodeCi, Utf8mb4ZhPinyinAsCs])
             (
                 "a".as_bytes(),
                 "a".as_bytes(),
                 [
+                    Ordering::Equal,
                     Ordering::Equal,
                     Ordering::Equal,
                     Ordering::Equal,
@@ -61,6 +65,7 @@ mod tests {
                     Ordering::Less,
                     Ordering::Equal,
                     Ordering::Equal,
+                    Ordering::Equal,
                 ],
             ),
             (
@@ -71,12 +76,14 @@ mod tests {
                     Ordering::Greater,
                     Ordering::Equal,
                     Ordering::Equal,
+                    Ordering::Greater,
                 ],
             ),
             (
                 "aa ".as_bytes(),
                 "a a".as_bytes(),
                 [
+                    Ordering::Greater,
                     Ordering::Greater,
                     Ordering::Greater,
                     Ordering::Greater,
@@ -91,6 +98,7 @@ mod tests {
                     Ordering::Less,
                     Ordering::Less,
                     Ordering::Less,
+                    Ordering::Less,
                 ],
             ),
             (
@@ -101,6 +109,7 @@ mod tests {
                     Ordering::Less,
                     Ordering::Equal,
                     Ordering::Equal,
+                    Ordering::Less,
                 ],
             ),
             (
@@ -111,6 +120,7 @@ mod tests {
                     Ordering::Less,
                     Ordering::Equal,
                     Ordering::Equal,
+                    Ordering::Less,
                 ],
             ),
             (
@@ -121,6 +131,18 @@ mod tests {
                     Ordering::Greater,
                     Ordering::Less,
                     Ordering::Equal,
+                    Ordering::Greater,
+                ],
+            ),
+            (
+                "设".as_bytes(),
+                "置".as_bytes(),
+                [
+                    Ordering::Greater,
+                    Ordering::Greater,
+                    Ordering::Greater,
+                    Ordering::Greater,
+                    Ordering::Less,
                 ],
             ),
         ];
@@ -174,12 +196,19 @@ mod tests {
             (Collation::Utf8Mb4BinNoPadding, 1),
             (Collation::Utf8Mb4GeneralCi, 2),
             (Collation::Utf8Mb4UnicodeCi, 3),
+            (Collation::Utf8Mb4ZhPinyinAsCs, 4),
         ];
         let cases = vec![
-            // (str, [Utf8Mb4Bin, Utf8Mb4BinNoPadding, Utf8Mb4GeneralCi, Utf8Mb4UnicodeCi])
+            // (str, [Utf8Mb4Bin, Utf8Mb4BinNoPadding, Utf8Mb4GeneralCi, Utf8Mb4UnicodeCi, Utf8mb4ZhPinyinAsCs])
             (
                 "a",
-                [vec![0x61], vec![0x61], vec![0x00, 0x41], vec![0x0E, 0x33]],
+                [
+                    vec![0x61],
+                    vec![0x61],
+                    vec![0x00, 0x41],
+                    vec![0x0E, 0x33],
+                    vec![0x61],
+                ],
             ),
             (
                 "A ",
@@ -188,11 +217,18 @@ mod tests {
                     vec![0x41, 0x20],
                     vec![0x00, 0x41],
                     vec![0x0E, 0x33],
+                    vec![0x41],
                 ],
             ),
             (
                 "A",
-                [vec![0x41], vec![0x41], vec![0x00, 0x41], vec![0x0E, 0x33]],
+                [
+                    vec![0x41],
+                    vec![0x41],
+                    vec![0x00, 0x41],
+                    vec![0x0E, 0x33],
+                    vec![0x41],
+                ],
             ),
             (
                 "😃",
@@ -201,6 +237,7 @@ mod tests {
                     vec![0xF0, 0x9F, 0x98, 0x83],
                     vec![0xff, 0xfd],
                     vec![0xff, 0xfd],
+                    vec![0xff, 0x03, 0xd8, 0x4b],
                 ],
             ),
             (
@@ -228,6 +265,11 @@ mod tests {
                         0x0E, 0x4A, 0x0E, 0x33, 0x10, 0x6A, 0x02, 0x09, 0x06, 0xFF, 0x02, 0x09,
                         0x0F, 0xB4, 0x10, 0x1F, 0x10, 0x5A,
                     ],
+                    vec![
+                        0x46, 0x6F, 0x6F, 0x20, 0xFF, 0x00, 0x00, 0x26, 0x20, 0x62, 0x61, 0x72,
+                        0x20, 0xFF, 0x03, 0xB5, 0x4E, 0x20, 0x62, 0x61, 0x7A, 0x20, 0xFF, 0x00,
+                        0x23, 0xC8, 0x20, 0x71, 0x75, 0x78,
+                    ],
                 ],
             ),
             (
@@ -240,6 +282,7 @@ mod tests {
                         0x13, 0x5E, 0x13, 0xAB, 0x02, 0x09, 0x13, 0x5E, 0x13, 0xAB, 0x13, 0x50,
                         0x13, 0xAB, 0x13, 0xB7,
                     ],
+                    vec![0xFF, 0x00, 0x98, 0x8F],
                 ],
             ),
         ];
