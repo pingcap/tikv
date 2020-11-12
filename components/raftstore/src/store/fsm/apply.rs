@@ -358,6 +358,7 @@ where
     /// Used for handling race between splitting and creating new peer.
     /// An uninitialized peer can be replaced to the one from splitting iff they are exactly the same peer.
     pending_create_peers: Arc<Mutex<HashMap<u64, (u64, bool)>>>,
+    proposal_count: usize,
 }
 
 impl<EK, W> ApplyContext<EK, W>
@@ -393,6 +394,7 @@ where
             kv_wb_last_keys: 0,
             last_applied_index: 0,
             committed_count: 0,
+            proposal_count: 0,
             sync_log_hint: false,
             exec_ctx: None,
             use_delete_range: cfg.use_delete_range,
@@ -410,9 +412,17 @@ where
     /// After all delegates are handled, `write_to_db` method should be called.
     pub fn prepare_for(&mut self, delegate: &mut ApplyDelegate<EK>) {
         self.prepare_write_batch();
-        self.cbs.push(ApplyCallback::new(delegate.region.clone()));
         self.last_applied_index = delegate.apply_state.get_applied_index();
-
+        // We do not need to prepare for every apply msg if they come from the same region and epoch
+        // has not changed.
+        if let Some(cb) = self.cbs.last() {
+            if cb.region.id == delegate.region.id
+                && cb.region.get_region_epoch() == delegate.region.get_region_epoch()
+            {
+                return;
+            }
+        }
+        self.cbs.push(ApplyCallback::new(delegate.region.clone()));
         if let Some(observe_cmd) = &delegate.observe_cmd {
             let region_id = delegate.region_id();
             if observe_cmd.enabled.load(Ordering::Acquire) {
@@ -467,7 +477,7 @@ where
         let need_sync = self.sync_log_hint;
         if self.kv_wb.as_ref().map_or(false, |wb| !wb.is_empty()) {
             let mut write_opts = engine_traits::WriteOptions::new();
-            write_opts.set_sync(need_sync);
+            write_opts.set_sync(false);
             self.kv_wb()
                 .write_to_engine(&self.engine, &write_opts)
                 .unwrap_or_else(|e| {
@@ -477,7 +487,6 @@ where
                 self.perf_context_statistics,
                 APPLY_PERF_CONTEXT_TIME_HISTOGRAM_STATIC
             );
-            self.sync_log_hint = false;
             let data_size = self.kv_wb().data_size();
             if data_size > APPLY_WB_SHRINK_SIZE {
                 // Control the memory usage for the WriteBatch.
@@ -489,6 +498,15 @@ where
             }
             self.kv_wb_last_bytes = 0;
             self.kv_wb_last_keys = 0;
+            self.proposal_count = 0;
+        }
+        if need_sync {
+            // We always write with sync set false because a sync write operation will block
+            // other thread write but sync operation does not.
+            self.engine.sync().unwrap_or_else(|e| {
+                panic!("failed to sync engine: {:?}", e);
+            });
+            self.sync_log_hint = false;
         }
         // Call it before invoking callback for preventing Commit is executed before Prewrite is observed.
         self.host.on_flush_apply(self.engine.clone());
@@ -932,7 +950,10 @@ where
         if !data.is_empty() {
             let cmd = util::parse_data_at(data, index, &self.tag);
 
-            if should_write_to_engine(&cmd) || apply_ctx.kv_wb().should_write_to_engine() {
+            // We can accumulate a larger WriteBatch for follower replication
+            if should_write_to_engine(&cmd)
+                || (apply_ctx.proposal_count > 0 && apply_ctx.kv_wb().should_write_to_engine())
+            {
                 apply_ctx.commit(self);
                 if let Some(start) = self.handle_start.as_ref() {
                     if start.elapsed() >= apply_ctx.yield_duration {
@@ -962,6 +983,7 @@ where
                     cmd_resp::err_resp(Error::StaleCommand, term),
                 ),
             );
+            apply_ctx.proposal_count += 1;
         }
         ApplyResult::None
     }
@@ -1077,6 +1099,9 @@ where
         // store will call it after handing exec result.
         cmd_resp::bind_term(&mut resp, self.term);
         let cmd_cb = self.find_pending(index, term, is_conf_change_cmd(&cmd));
+        if cmd_cb.is_some() {
+            apply_ctx.proposal_count += 1;
+        }
         let cmd = Cmd::new(index, cmd, resp);
         if let Some(observe_cmd) = self.observe_cmd.as_ref() {
             apply_ctx
@@ -3068,7 +3093,9 @@ where
         self.delegate.apply_state.set_commit_index(cur_state.1);
         self.delegate.apply_state.set_commit_term(cur_state.2);
 
-        self.append_proposal(apply.cbs.drain(..));
+        if !apply.cbs.is_empty() {
+            self.append_proposal(apply.cbs.drain(..));
+        }
         self.delegate
             .handle_raft_committed_entries(apply_ctx, apply.entries.drain(..));
         fail_point!("post_handle_apply_1003", self.delegate.id() == 1003, |_| {});
