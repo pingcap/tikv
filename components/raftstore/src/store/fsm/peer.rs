@@ -473,6 +473,7 @@ where
 
     pub fn handle_msgs(&mut self, msgs: &mut Vec<PeerMsg<EK>>) {
         for m in msgs.drain(..) {
+            self.fsm.has_ready |= self.fsm.peer.check_new_persisted();
             match m {
                 PeerMsg::RaftMessage(msg) => {
                     if let Err(e) = self.on_raft_message(msg) {
@@ -912,10 +913,17 @@ where
         }
     }
 
-    pub fn post_raft_ready_append(&mut self, ready: Ready, invoke_ctx: InvokeContext) {
+    pub fn post_raft_ready_append(
+        &mut self,
+        ready: Ready,
+        invoke_ctx: InvokeContext,
+        unsynced_version: Option<u64>,
+    ) {
         let is_merging = self.fsm.peer.pending_merge_state.is_some();
         let res = self.fsm.peer.post_raft_ready_append(self.ctx, invoke_ctx);
-        self.fsm.peer.handle_raft_ready_advance(self.ctx, ready);
+        self.fsm
+            .peer
+            .handle_raft_ready_advance(self.ctx, ready, unsynced_version);
         if let Some(apply_res) = res {
             self.on_ready_apply_snapshot(apply_res);
             if is_merging {
@@ -1825,6 +1833,12 @@ where
             // data too.
             panic!("{} destroy err {:?}", self.fsm.peer.tag, e);
         }
+        self.ctx
+            .sync_policy
+            .metrics
+            .sync_events
+            .on_peer_destroy_sync();
+
         // Some places use `force_send().unwrap()` if the StoreMeta lock is held.
         // So in here, it's necessary to held the StoreMeta lock when closing the router.
         self.ctx.router.close(region_id);

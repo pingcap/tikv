@@ -471,13 +471,18 @@ where
     /// Check whether this proposal can be proposed based on its epoch.
     cmd_epoch_checker: CmdEpochChecker<EK::Snapshot>,
 
-    /// The number of the last unpersisted ready.
-    last_unpersisted_number: u64,
-
     /// The number of pending pd heartbeat tasks. Pd heartbeat task may be blocked by
     /// reading rocksdb. To avoid unnecessary io operations, we always let the later
     /// task run when there are more than 1 pending tasks.
     pub pending_pd_heartbeat_tasks: Arc<AtomicU64>,
+
+    /// The number of unpersisted readies: (ready number, the number of following ready
+    /// whose must-sync is false)
+    unpersisted_numbers: VecDeque<(u64, u64)>,
+    /// (Whether the last ready has a snapshot, Whether this snapshot is persisted)
+    last_snapshot_ready: (bool, bool),
+    /// Outside code use it to notify the latest persisted number to this peer.
+    persisted_notifier: Arc<AtomicU64>,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -569,8 +574,10 @@ where
             txn_extra_op: Arc::new(AtomicCell::new(TxnExtraOp::Noop)),
             max_ts_sync_status: Arc::new(AtomicU64::new(0)),
             cmd_epoch_checker: Default::default(),
-            last_unpersisted_number: 0,
             pending_pd_heartbeat_tasks: Arc::new(AtomicU64::new(0)),
+            unpersisted_numbers: VecDeque::default(),
+            last_snapshot_ready: (false, false),
+            persisted_notifier: Arc::new(AtomicU64::new(0)),
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -1477,13 +1484,9 @@ where
             && !self.replication_sync
     }
 
-    pub fn handle_raft_ready_append<T: Transport>(
-        &mut self,
-        ctx: &mut PollContext<EK, ER, T>,
-    ) -> Option<(Ready, InvokeContext)> {
-        if self.pending_remove {
-            return None;
-        }
+    /// Check current snapshot status.
+    /// Returns whether it's valid to handle raft ready.
+    fn check_snap_status<T: Transport>(&mut self, ctx: &mut PollContext<EK, ER, T>) -> bool {
         match self.mut_store().check_applying_snap() {
             CheckApplyingSnapStatus::Applying => {
                 // If this peer is applying snapshot, we should not get a new ready.
@@ -1502,15 +1505,46 @@ where
                     "region_id" => self.region_id,
                     "peer_id" => self.peer.get_id(),
                 );
-                return None;
+                false
             }
             CheckApplyingSnapStatus::Success => {
                 self.post_pending_read_index_on_replica(ctx);
                 // If there is a snapshot, it must belongs to the last ready.
-                self.raft_group
-                    .on_persist_ready(self.last_unpersisted_number);
+                assert_eq!(self.last_snapshot_ready, (true, false));
+                self.last_snapshot_ready = (true, true);
+                if self.unpersisted_numbers.is_empty() {
+                    let number = self.persisted_notifier.load(Ordering::Acquire);
+                    self.raft_group.on_persist_ready(number);
+                    self.last_snapshot_ready = (false, false);
+                    true
+                } else {
+                    false
+                }
             }
-            CheckApplyingSnapStatus::Idle => {}
+            CheckApplyingSnapStatus::Idle => {
+                if self.last_snapshot_ready.0 {
+                    // If the `last_snapshot_ready.0` is true, it means
+                    // the last ready has not been persisted yet.
+                    assert_eq!(self.last_snapshot_ready, (true, true));
+                    assert!(!self.unpersisted_numbers.is_empty());
+                    false
+                } else {
+                    true
+                }
+            }
+        }
+    }
+
+    pub fn handle_raft_ready_append<T: Transport>(
+        &mut self,
+        ctx: &mut PollContext<EK, ER, T>,
+    ) -> Option<(Ready, InvokeContext)> {
+        if self.pending_remove {
+            return None;
+        }
+
+        if !self.check_snap_status(ctx) {
+            return None;
         }
 
         let mut destroy_regions = vec![];
@@ -1521,9 +1555,19 @@ where
                     "not ready to apply snapshot";
                     "region_id" => self.region_id,
                     "peer_id" => self.peer.get_id(),
-                    "apply_index" => self.get_store().applied_index(),
+                    "applied_index" => self.get_store().applied_index(),
                     "last_applying_index" => self.last_applying_idx,
                     "pending_request_snapshot_count" => count,
+                );
+                return None;
+            }
+
+            if !self.unpersisted_numbers.is_empty() {
+                debug!(
+                    "not ready to apply snapshot because some unpersisted readies have not persisted yet";
+                    "region_id" => self.region_id,
+                    "peer_id" => self.peer.get_id(),
+                    "unpersisted_numbers" => ?self.unpersisted_numbers,
                 );
                 return None;
             }
@@ -1580,8 +1624,6 @@ where
         );
 
         let mut ready = self.raft_group.ready();
-
-        self.last_unpersisted_number = ready.number();
 
         if !ready.must_sync() {
             // If this ready need not to sync, the term, vote must not be changed,
@@ -1769,12 +1811,47 @@ where
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
         ready: Ready,
+        unsynced_version: Option<u64>,
     ) {
-        assert_eq!(ready.number(), self.last_unpersisted_number);
+        let is_synced = if let Some(version) = unsynced_version {
+            if ready.must_sync() {
+                ctx.sync_policy.mark_region_unsynced(
+                    version,
+                    self.region_id,
+                    ready.number(),
+                    self.persisted_notifier.clone(),
+                );
+                self.unpersisted_numbers
+                    .push_back((ready.number(), ready.number()));
+                false
+            } else if let Some(last) = self.unpersisted_numbers.back_mut() {
+                // Attach to the last unpersisted ready so that it can be considered to be
+                // persisted with the last ready at the same time.
+                last.1 = ready.number();
+                false
+            } else {
+                // If this ready need not to be synced and there is no previous unpersisted ready,
+                // we can safely consider it is persisted and call `advance_append` latter.
+                // It's probably the case that the follower of a cold region receives a heartbeat.
+                true
+            }
+        } else {
+            true
+        };
+
+        if is_synced {
+            self.unpersisted_numbers.clear();
+            self.persisted_notifier
+                .store(ready.number(), Ordering::Release);
+        }
+
         if !ready.snapshot().is_empty() {
+            self.last_snapshot_ready = (true, false);
+            // Although `is_synced` may be true, `advance_append_async` must be called because
+            // the snapshot has not applied yet.
+            self.raft_group.advance_append_async(ready);
             // Snapshot's metadata has been applied.
             self.last_applying_idx = self.get_store().truncated_index();
-            self.raft_group.advance_append_async(ready);
             // Because we only handle raft ready when not applying snapshot, so following
             // line won't be called twice for the same snapshot.
             self.raft_group.advance_apply_to(self.last_applying_idx);
@@ -1783,35 +1860,88 @@ where
                 self.term(),
                 self.raft_group.store().region(),
             );
-            return;
-        }
+        } else if !is_synced {
+            self.raft_group.advance_append_async(ready);
+        } else {
+            let mut light_rd = self.raft_group.advance_append(ready);
 
-        let mut light_rd = self.raft_group.advance_append(ready);
+            self.add_light_ready_metric(&light_rd, &mut ctx.raft_metrics.ready);
 
-        self.add_light_ready_metric(&light_rd, &mut ctx.raft_metrics.ready);
+            if let Some(commit_index) = light_rd.commit_index() {
+                let pre_commit_index = self.get_store().commit_index();
+                assert!(commit_index >= pre_commit_index);
+                // No need to persist the commit index but the one in memory
+                // (i.e. commit of hardstate in PeerStorage) should be updated.
+                self.mut_store().set_commit_index(commit_index);
+                if self.is_leader() {
+                    self.on_leader_commit_idx_changed(pre_commit_index, commit_index);
+                }
+            }
 
-        if let Some(commit_index) = light_rd.commit_index() {
-            let pre_commit_index = self.get_store().commit_index();
-            assert!(commit_index >= pre_commit_index);
-            // No need to persist the commit index but the one in memory
-            // (i.e. commit of hardstate in PeerStorage) should be updated.
-            self.mut_store().set_commit_index(commit_index);
-            if self.is_leader() {
-                self.on_leader_commit_idx_changed(pre_commit_index, commit_index);
+            if !light_rd.messages().is_empty() {
+                if !self.is_leader() {
+                    fail_point!("raft_before_follower_send");
+                }
+                for vec_msg in light_rd.take_messages() {
+                    self.send(&mut ctx.trans, vec_msg, &mut ctx.raft_metrics.message);
+                }
+            }
+
+            if !light_rd.committed_entries().is_empty() {
+                self.handle_raft_committed_entries(ctx, light_rd.take_committed_entries());
             }
         }
+    }
 
-        if !light_rd.messages().is_empty() {
-            if !self.is_leader() {
-                fail_point!("raft_before_follower_send");
+    /// Returns if there are new persisted readies.
+    pub fn check_new_persisted(&mut self) -> bool {
+        if self.unpersisted_numbers.is_empty() {
+            return false;
+        }
+        let number = self.persisted_notifier.load(Ordering::Acquire);
+        if number < self.unpersisted_numbers.front().unwrap().0 {
+            return false;
+        }
+        let last_unpersisted_number = self.unpersisted_numbers.back().unwrap().0;
+        assert!(
+            number <= last_unpersisted_number,
+            "{} persisted number {} > last_unpersisted_number {}, unpersisted numbers {:?}",
+            self.tag,
+            number,
+            last_unpersisted_number,
+            self.unpersisted_numbers
+        );
+        // There must be a match in `self.unpersisted_numbers`
+        let mut persisted_number = 0;
+        while let Some(v) = self.unpersisted_numbers.front() {
+            if number < v.0 {
+                break;
             }
-            for vec_msg in light_rd.take_messages() {
-                self.send(&mut ctx.trans, vec_msg, &mut ctx.raft_metrics.message);
+            let v = self.unpersisted_numbers.pop_front().unwrap();
+            if number == v.0 {
+                persisted_number = v.1;
+                break;
             }
         }
+        if persisted_number == 0 {
+            panic!(
+                "{} no match of persisted number {}, unpersisted numbers {:?}",
+                self.tag, number, self.unpersisted_numbers
+            );
+        }
 
-        if !light_rd.committed_entries().is_empty() {
-            self.handle_raft_committed_entries(ctx, light_rd.take_committed_entries());
+        if self.last_snapshot_ready.0 {
+            if self.last_snapshot_ready.1 && self.unpersisted_numbers.is_empty() {
+                self.raft_group.on_persist_ready(persisted_number);
+                self.last_snapshot_ready = (false, false);
+                true
+            } else {
+                // Should wait for applying snapshot or persisting the last ready
+                false
+            }
+        } else {
+            self.raft_group.on_persist_ready(persisted_number);
+            true
         }
     }
 

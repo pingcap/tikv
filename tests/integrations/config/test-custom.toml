@@ -156,6 +156,7 @@ hibernate-regions = false
 hibernate-timeout = "1h"
 dev-assert = true
 perf-level = 5
+delay-sync-us = 1500
 
 [coprocessor]
 split-region-on-table = false

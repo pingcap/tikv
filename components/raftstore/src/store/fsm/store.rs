@@ -49,6 +49,7 @@ use crate::store::fsm::metrics::*;
 use crate::store::fsm::peer::{
     maybe_destroy_source, new_admin_request, PeerFsm, PeerFsmDelegate, SenderFsmPair,
 };
+use crate::store::fsm::sync_policy::{new_sync_policy, SyncAction, SyncPolicy};
 use crate::store::fsm::ApplyNotifier;
 use crate::store::fsm::ApplyTaskRes;
 use crate::store::fsm::{
@@ -337,6 +338,7 @@ where
     pub perf_context_statistics: PerfContextStatistics,
     pub tick_batch: Vec<PeerTickBatch>,
     pub node_start_time: Option<TiInstant>,
+    pub sync_policy: SyncPolicy<SyncAction<EK, ER>>,
 }
 
 impl<EK, ER, T> HandleRaftReadyContext<EK::WriteBatch, ER::LogBatch> for PollContext<EK, ER, T>
@@ -655,7 +657,8 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
         }
         fail_point!("raft_between_save");
 
-        if !self.poll_ctx.raft_wb.is_empty() {
+        let raft_wb_is_empty = self.poll_ctx.raft_wb.is_empty();
+        if !raft_wb_is_empty {
             fail_point!(
                 "raft_before_save_on_store_1",
                 self.poll_ctx.store_id() == 1,
@@ -666,7 +669,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
                 .raft
                 .consume_and_shrink(
                     &mut self.poll_ctx.raft_wb,
-                    true,
+                    false,
                     RAFT_WB_SHRINK_SIZE,
                     4 * 1024,
                 )
@@ -675,12 +678,29 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
                 });
         }
 
+        let synced = if self.poll_ctx.sync_policy.delay_sync_enabled() {
+            self.poll_ctx.sync_policy.sync_if_needed(true)
+        } else {
+            if !raft_wb_is_empty {
+                self.poll_ctx.engines.raft.sync().unwrap_or_else(|e| {
+                    panic!("{} failed to sync raft engine: {:?}", self.tag, e);
+                });
+            }
+            true
+        };
+
         report_perf_context!(
             self.poll_ctx.perf_context_statistics,
             STORE_PERF_CONTEXT_TIME_HISTOGRAM_STATIC
         );
         fail_point!("raft_after_save");
+
         if ready_cnt != 0 {
+            let unsynced_version = if synced {
+                None
+            } else {
+                Some(self.poll_ctx.sync_policy.new_unsynced_version())
+            };
             let mut batch_pos = 0;
             let mut ready_res = mem::take(&mut self.poll_ctx.ready_res);
             for (ready, invoke_ctx) in ready_res.drain(..) {
@@ -692,7 +712,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> RaftPoller<EK, ER, T> {
                     }
                 }
                 PeerFsmDelegate::new(&mut peers[batch_pos], &mut self.poll_ctx)
-                    .post_raft_ready_append(ready, invoke_ctx);
+                    .post_raft_ready_append(ready, invoke_ctx, unsynced_version);
             }
         }
         let dur = self.timer.elapsed();
@@ -777,6 +797,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
             self.poll_ctx.cfg = incoming.clone();
             self.poll_ctx.update_ticks_timeout();
         }
+        self.poll_ctx.sync_policy.try_flush_readies();
     }
 
     fn handle_control(&mut self, store: &mut StoreFsm<EK>) -> Option<usize> {
@@ -845,6 +866,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
 
     fn end(&mut self, peers: &mut [Box<PeerFsm<EK, ER>>]) {
         self.flush_ticks();
+        self.poll_ctx.sync_policy.try_flush_readies();
         if self.poll_ctx.has_ready {
             self.handle_raft_ready(peers);
         }
@@ -854,13 +876,18 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
             .process_ready
             .observe(duration_to_sec(self.timer.elapsed()) as f64);
         self.poll_ctx.raft_metrics.flush();
+        self.poll_ctx.sync_policy.metrics.flush();
         self.poll_ctx.store_stat.flush();
     }
 
-    fn pause(&mut self) {
+    fn pause(&mut self) -> bool {
+        let all_synced_and_flushed = self.poll_ctx.sync_policy.try_sync_and_flush();
         if self.poll_ctx.trans.need_flush() {
             self.poll_ctx.trans.flush();
         }
+        // If there are cached data and go into pause status, that will cause high latency or hunger
+        // so it should return false(means pause failed) when there are still jobs to do
+        all_synced_and_flushed
     }
 }
 
@@ -885,6 +912,7 @@ pub struct RaftPollerBuilder<EK: KvEngine, ER: RaftEngine, T> {
     pub engines: Engines<EK, ER>,
     applying_snap_count: Arc<AtomicUsize>,
     global_replication_state: Arc<Mutex<GlobalReplicationState>>,
+    pub sync_policy: SyncPolicy<SyncAction<EK, ER>>,
 }
 
 impl<EK: KvEngine, ER: RaftEngine, T> RaftPollerBuilder<EK, ER, T> {
@@ -1094,6 +1122,7 @@ where
             perf_context_statistics: PerfContextStatistics::new(self.cfg.value().perf_level),
             tick_batch: vec![PeerTickBatch::default(); 256],
             node_start_time: Some(TiInstant::now_coarse()),
+            sync_policy: self.sync_policy.clone(),
         };
         ctx.update_ticks_timeout();
         let tag = format!("[store {}]", ctx.store.get_id());
@@ -1207,7 +1236,12 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         let consistency_check_scheduler = workers
             .background_worker
             .start("consistency-check", consistency_check_runner);
-
+        let sync_policy = new_sync_policy(
+            engines.raft.clone(),
+            self.router.clone(),
+            cfg.value().delay_sync_enabled(),
+            cfg.value().delay_sync_us as i64,
+        );
         let mut builder = RaftPollerBuilder {
             cfg,
             store: meta,
@@ -1229,6 +1263,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             store_meta,
             pending_create_peers: Arc::new(Mutex::new(HashMap::default())),
             applying_snap_count: Arc::new(AtomicUsize::new(0)),
+            sync_policy,
         };
         let region_peers = builder.init()?;
         let engine = builder.engines.kv.clone();
