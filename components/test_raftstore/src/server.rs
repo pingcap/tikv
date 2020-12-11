@@ -60,8 +60,7 @@ use tikv_util::worker::{Builder as WorkerBuilder, FutureWorker, LazyWorker};
 use tikv_util::HandyRwLock;
 
 type SimulateStoreTransport = SimulateTransport<ServerRaftStoreRouter<RocksEngine, RocksEngine>>;
-type SimulateServerTransport =
-    SimulateTransport<ServerTransport<SimulateStoreTransport, PdStoreAddrResolver>>;
+type SimulateServerTransport = SimulateTransport<ServerTransport<PdStoreAddrResolver>>;
 
 pub type SimulateEngine = RaftKv<SimulateStoreTransport>;
 
@@ -101,7 +100,7 @@ impl StoreAddrResolver for AddressMap {
 
 struct ServerMeta {
     node: Node<TestPdClient, RocksEngine>,
-    server: Server<SimulateStoreTransport, PdStoreAddrResolver>,
+    server: Server,
     sim_router: SimulateStoreTransport,
     sim_trans: SimulateServerTransport,
     raw_router: RaftRouter<RocksEngine, RocksEngine>,
@@ -123,7 +122,7 @@ pub struct ServerCluster {
     pub security_mgr: Arc<SecurityManager>,
     snap_paths: HashMap<u64, TempDir>,
     pd_client: Arc<TestPdClient>,
-    raft_client: RaftClient<AddressMap, RaftStoreBlackHole>,
+    raft_client: RaftClient<AddressMap>,
     concurrency_managers: HashMap<u64, ConcurrencyManager>,
     env: Arc<Environment>,
 }
@@ -145,7 +144,7 @@ impl ServerCluster {
             Arc::default(),
             security_mgr.clone(),
             map.clone(),
-            RaftStoreBlackHole,
+            Box::new(RaftStoreBlackHole),
             worker.scheduler(),
         );
         let raft_client = RaftClient::new(conn_builder);
@@ -333,7 +332,6 @@ impl Simulator for ServerCluster {
                 store.clone(),
                 cop.clone(),
                 sim_router.clone(),
-                resolver.clone(),
                 snap_mgr.clone(),
                 gc_worker.clone(),
                 self.env.clone(),
@@ -366,7 +364,7 @@ impl Simulator for ServerCluster {
         let mut server = server.unwrap();
         let addr = server.listening_addr();
         cfg.server.addr = format!("{}", addr);
-        let trans = server.transport();
+        let trans = server.create_transport(&server_cfg, &security_mgr, resolver.clone());
         let simulate_trans = SimulateTransport::new(trans);
         let server_cfg = Arc::new(cfg.server.clone());
         let apply_router = system.apply_router();

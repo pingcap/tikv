@@ -160,8 +160,8 @@ struct TiKVEngines<ER: RaftEngine> {
 
 struct Servers<ER: RaftEngine> {
     lock_mgr: LockManager,
-    server: Server<RaftRouter<RocksEngine, ER>, resolve::PdStoreAddrResolver>,
-    node: Node<RpcClient, ER>,
+    server: Server,
+    node: Node<ER>,
     importer: Arc<SSTImporter>,
     cdc_scheduler: tikv_util::worker::Scheduler<cdc::Task>,
 }
@@ -397,7 +397,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
         let compacted_handler =
             Box::new(move |compacted_event: engine_rocks::RocksCompactedEvent| {
                 let ch = ch.lock().unwrap();
-                let event = StoreMsg::CompactedEvent(compacted_event);
+                let event = StoreMsg::CompactedEvent(Box::new(compacted_event));
                 if let Err(e) = ch.send_control(event) {
                     error!(?e; "send compaction finished event to raftstore failed");
                 }
@@ -582,7 +582,6 @@ impl<ER: RaftEngine> TiKVServer<ER> {
                 self.config.coprocessor.perf_level,
             ),
             self.router.clone(),
-            self.resolver.clone(),
             snap_mgr.clone(),
             gc_worker.clone(),
             self.env.clone(),
@@ -639,7 +638,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
 
         node.start(
             engines.engines.clone(),
-            server.transport(),
+            server.create_transport(&server_config, &self.security_mgr, self.resolver.clone()),
             snap_mgr,
             pd_worker,
             engines.store_meta.clone(),

@@ -13,7 +13,8 @@ use engine_rocks::{RocksEngine, RocksSnapshot};
 use kvproto::raft_cmdpb::RaftCmdRequest;
 use kvproto::raft_serverpb::RaftMessage;
 use raft::eraftpb::MessageType;
-use raftstore::router::{LocalReadRouter, RaftStoreRouter};
+use raft::SnapshotStatus;
+use raftstore::router::{LocalReadRouter, RaftPeerRouter, RaftStoreRouter};
 use raftstore::store::{
     Callback, CasualMessage, CasualRouter, PeerMsg, ProposalRouter, RaftCommand, SignificantMsg,
     StoreMsg, StoreRouter, Transport,
@@ -195,8 +196,8 @@ impl<C: Transport> Transport for SimulateTransport<C> {
     }
 }
 
-impl<C: RaftStoreRouter<RocksEngine>> StoreRouter<RocksEngine> for SimulateTransport<C> {
-    fn send(&self, msg: StoreMsg<RocksEngine>) -> Result<()> {
+impl<C: RaftStoreRouter<RocksEngine>> StoreRouter for SimulateTransport<C> {
+    fn send(&self, msg: StoreMsg) -> Result<()> {
         StoreRouter::send(&self.ch, msg)
     }
 }
@@ -216,11 +217,44 @@ impl<C: RaftStoreRouter<RocksEngine>> CasualRouter<RocksEngine> for SimulateTran
     }
 }
 
-impl<C: RaftStoreRouter<RocksEngine>> RaftStoreRouter<RocksEngine> for SimulateTransport<C> {
+impl<C: RaftStoreRouter<RocksEngine> + 'static> RaftPeerRouter for SimulateTransport<C> {
     fn send_raft_msg(&self, msg: RaftMessage) -> Result<()> {
         filter_send(&self.filters, msg, |m| self.ch.send_raft_msg(m))
     }
+    fn clone_box(&self) -> Box<dyn RaftPeerRouter> {
+        Box::new(self.clone())
+    }
 
+    fn report_snapshot_status(
+        &self,
+        region_id: u64,
+        to_peer_id: u64,
+        status: SnapshotStatus,
+    ) -> RaftStoreResult<()> {
+        self.significant_send(
+            region_id,
+            SignificantMsg::SnapshotStatus {
+                region_id,
+                to_peer_id,
+                status,
+            },
+        )
+    }
+
+    fn report_unreachable(&self, region_id: u64, to_peer_id: u64) -> RaftStoreResult<()> {
+        self.significant_send(
+            region_id,
+            SignificantMsg::Unreachable {
+                region_id,
+                to_peer_id,
+            },
+        )
+    }
+}
+
+impl<C: RaftStoreRouter<RocksEngine> + 'static> RaftStoreRouter<RocksEngine>
+    for SimulateTransport<C>
+{
     fn significant_send(&self, region_id: u64, msg: SignificantMsg<RocksSnapshot>) -> Result<()> {
         self.ch.significant_send(region_id, msg)
     }

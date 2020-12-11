@@ -5,9 +5,7 @@ use std::fmt::{self, Display, Formatter};
 use super::cleanup_sst::{Runner as CleanupSSTRunner, Task as CleanupSSTTask};
 use super::compact::{Runner as CompactRunner, Task as CompactTask};
 
-use crate::store::StoreRouter;
 use engine_traits::KvEngine;
-use pd_client::PdClient;
 use tikv_util::worker::Runnable;
 
 pub enum Task {
@@ -24,25 +22,19 @@ impl Display for Task {
     }
 }
 
-pub struct Runner<E, C, S>
+pub struct Runner<E>
 where
     E: KvEngine,
-    S: StoreRouter<E>,
 {
     compact: CompactRunner<E>,
-    cleanup_sst: CleanupSSTRunner<E, C, S>,
+    cleanup_sst: CleanupSSTRunner,
 }
 
-impl<E, C, S> Runner<E, C, S>
+impl<E> Runner<E>
 where
     E: KvEngine,
-    C: PdClient,
-    S: StoreRouter<E>,
 {
-    pub fn new(
-        compact: CompactRunner<E>,
-        cleanup_sst: CleanupSSTRunner<E, C, S>,
-    ) -> Runner<E, C, S> {
+    pub fn new(compact: CompactRunner<E>, cleanup_sst: CleanupSSTRunner) -> Runner<E> {
         Runner {
             compact,
             cleanup_sst,
@@ -50,11 +42,9 @@ where
     }
 }
 
-impl<E, C, S> Runnable for Runner<E, C, S>
+impl<E> Runnable for Runner<E>
 where
     E: KvEngine,
-    C: PdClient,
-    S: StoreRouter<E>,
 {
     type Task = Task;
 

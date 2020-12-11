@@ -18,7 +18,7 @@ use crate::server::gc_worker::GcWorker;
 use crate::storage::lock_manager::LockManager;
 use crate::storage::{Engine, Storage};
 use engine_rocks::RocksEngine;
-use raftstore::router::RaftStoreRouter;
+use raftstore::router::{RaftPeerRouter, RaftStoreRouter};
 use raftstore::store::SnapManager;
 use security::SecurityManager;
 use tikv_util::timer::GLOBAL_TIMER_HANDLE;
@@ -44,16 +44,14 @@ pub const STATS_THREAD_PREFIX: &str = "transport-stats";
 ///
 /// It hosts various internal components, including gRPC, the raftstore router
 /// and a snapshot worker.
-pub struct Server<T: RaftStoreRouter<RocksEngine> + 'static, S: StoreAddrResolver + 'static> {
+pub struct Server {
     env: Arc<Environment>,
     /// A GrpcServer builder or a GrpcServer.
     ///
     /// If the listening port is configured, the server will be started lazily.
     builder_or_server: Option<Either<ServerBuilder, GrpcServer>>,
     local_addr: SocketAddr,
-    // Transport.
-    trans: ServerTransport<T, S>,
-    raft_router: T,
+    raft_router: Box<dyn RaftPeerRouter>,
     // For sending/receiving snapshots.
     snap_mgr: SnapManager,
     snap_worker: LazyWorker<SnapTask>,
@@ -67,15 +65,14 @@ pub struct Server<T: RaftStoreRouter<RocksEngine> + 'static, S: StoreAddrResolve
     timer: Handle,
 }
 
-impl<T: RaftStoreRouter<RocksEngine> + Unpin, S: StoreAddrResolver + 'static> Server<T, S> {
+impl Server {
     #[allow(clippy::too_many_arguments)]
-    pub fn new<E: Engine, L: LockManager>(
+    pub fn new<E: Engine, L: LockManager, T: RaftStoreRouter<RocksEngine> + Unpin>(
         cfg: &Arc<Config>,
         security_mgr: &Arc<SecurityManager>,
         storage: Storage<E, L>,
         cop: Endpoint<E>,
         raft_router: T,
-        resolver: S,
         snap_mgr: SnapManager,
         gc_worker: GcWorker<E, T>,
         env: Arc<Environment>,
@@ -136,24 +133,11 @@ impl<T: RaftStoreRouter<RocksEngine> + Unpin, S: StoreAddrResolver + 'static> Se
             Either::Left(sb)
         };
 
-        let conn_builder = ConnectionBuilder::new(
-            env.clone(),
-            cfg.clone(),
-            security_mgr.clone(),
-            resolver,
-            raft_router.clone(),
-            lazy_worker.scheduler(),
-        );
-        let raft_client = RaftClient::new(conn_builder);
-
-        let trans = ServerTransport::new(raft_client);
-
         let svr = Server {
             env: Arc::clone(&env),
             builder_or_server: Some(builder),
             local_addr: addr,
-            trans,
-            raft_router,
+            raft_router: Box::new(raft_router),
             snap_mgr,
             snap_worker: lazy_worker,
             stats_pool,
@@ -171,8 +155,23 @@ impl<T: RaftStoreRouter<RocksEngine> + Unpin, S: StoreAddrResolver + 'static> Se
         self.debug_thread_pool.handle()
     }
 
-    pub fn transport(&self) -> ServerTransport<T, S> {
-        self.trans.clone()
+    pub fn create_transport<S: StoreAddrResolver + 'static>(
+        &self,
+        cfg: &Arc<Config>,
+        security_mgr: &Arc<SecurityManager>,
+        resolver: S,
+    ) -> ServerTransport<S> {
+        let conn_builder = ConnectionBuilder::new(
+            self.env.clone(),
+            cfg.clone(),
+            security_mgr.clone(),
+            resolver,
+            self.raft_router.clone_box(),
+            self.snap_worker.scheduler(),
+        );
+        let raft_client = RaftClient::new(conn_builder);
+
+        ServerTransport::new(raft_client)
     }
 
     pub fn env(&self) -> Arc<Environment> {
@@ -213,7 +212,7 @@ impl<T: RaftStoreRouter<RocksEngine> + Unpin, S: StoreAddrResolver + 'static> Se
         let snap_runner = SnapHandler::new(
             Arc::clone(&self.env),
             self.snap_mgr.clone(),
-            self.raft_router.clone(),
+            self.raft_router.clone_box(),
             security_mgr,
             Arc::clone(&cfg),
         );
@@ -282,6 +281,8 @@ pub mod test_router {
     use engine_rocks::RocksSnapshot;
     use engine_traits::{KvEngine, Snapshot};
     use kvproto::raft_serverpb::RaftMessage;
+    use raft::SnapshotStatus;
+    use raftstore::router::RaftPeerRouter;
 
     #[derive(Clone)]
     pub struct TestRaftStoreRouter {
@@ -301,8 +302,8 @@ pub mod test_router {
         }
     }
 
-    impl StoreRouter<RocksEngine> for TestRaftStoreRouter {
-        fn send(&self, _: StoreMsg<RocksEngine>) -> RaftStoreResult<()> {
+    impl StoreRouter for TestRaftStoreRouter {
+        fn send(&self, _: StoreMsg) -> RaftStoreResult<()> {
             self.tx.send(1).unwrap();
             Ok(())
         }
@@ -325,12 +326,42 @@ pub mod test_router {
         }
     }
 
-    impl RaftStoreRouter<RocksEngine> for TestRaftStoreRouter {
+    impl RaftPeerRouter for TestRaftStoreRouter {
         fn send_raft_msg(&self, _: RaftMessage) -> RaftStoreResult<()> {
             self.tx.send(1).unwrap();
             Ok(())
         }
 
+        fn clone_box(&self) -> Box<dyn RaftPeerRouter> {
+            Box::new(self.clone())
+        }
+
+        fn report_snapshot_status(
+            &self,
+            region_id: u64,
+            to_peer_id: u64,
+            status: SnapshotStatus,
+        ) -> RaftStoreResult<()> {
+            let msg = SignificantMsg::SnapshotStatus {
+                region_id,
+                to_peer_id,
+                status,
+            };
+            self.significant_send(region_id, msg)
+        }
+
+        fn report_unreachable(&self, region_id: u64, to_peer_id: u64) -> RaftStoreResult<()> {
+            self.significant_send(
+                region_id,
+                SignificantMsg::Unreachable {
+                    region_id,
+                    to_peer_id,
+                },
+            )
+        }
+    }
+
+    impl RaftStoreRouter<RocksEngine> for TestRaftStoreRouter {
         fn significant_send(
             &self,
             _: u64,
@@ -463,10 +494,6 @@ mod tests {
             storage,
             cop,
             router.clone(),
-            MockResolver {
-                quick_fail: Arc::clone(&quick_fail),
-                addr: Arc::clone(&addr),
-            },
             SnapManager::new(""),
             gc_worker,
             env,
@@ -478,7 +505,14 @@ mod tests {
         server.build_and_bind().unwrap();
         server.start(cfg, security_mgr).unwrap();
 
-        let mut trans = server.transport();
+        let mut trans = server.create_transport(
+            &cfg,
+            &security_mgr,
+            MockResolver {
+                quick_fail: Arc::clone(&quick_fail),
+                addr: Arc::clone(&addr),
+            },
+        );
         router.report_unreachable(0, 0).unwrap();
         let mut resp = significant_msg_receiver.try_recv().unwrap();
         assert!(is_unreachable_to(&resp, 0, 0), "{:?}", resp);

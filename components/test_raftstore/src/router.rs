@@ -6,8 +6,9 @@ use collections::HashMap;
 use crossbeam::channel::TrySendError;
 use engine_rocks::{RocksEngine, RocksSnapshot};
 use kvproto::raft_serverpb::RaftMessage;
+use raft::SnapshotStatus;
 use raftstore::errors::{Error as RaftStoreError, Result as RaftStoreResult};
-use raftstore::router::{handle_send_error, RaftStoreRouter};
+use raftstore::router::{handle_send_error, RaftPeerRouter, RaftStoreRouter};
 use raftstore::store::msg::{CasualMessage, PeerMsg, SignificantMsg};
 use raftstore::store::{CasualRouter, ProposalRouter, RaftCommand, StoreMsg, StoreRouter};
 use tikv_util::mpsc::{loose_bounded, LooseBoundedSender, Receiver};
@@ -31,8 +32,8 @@ impl MockRaftStoreRouter {
     }
 }
 
-impl StoreRouter<RocksEngine> for MockRaftStoreRouter {
-    fn send(&self, _: StoreMsg<RocksEngine>) -> RaftStoreResult<()> {
+impl StoreRouter for MockRaftStoreRouter {
+    fn send(&self, _: StoreMsg) -> RaftStoreResult<()> {
         unimplemented!();
     }
 }
@@ -58,11 +59,31 @@ impl CasualRouter<RocksEngine> for MockRaftStoreRouter {
     }
 }
 
-impl RaftStoreRouter<RocksEngine> for MockRaftStoreRouter {
+impl RaftPeerRouter for MockRaftStoreRouter {
     fn send_raft_msg(&self, _: RaftMessage) -> RaftStoreResult<()> {
         unimplemented!()
     }
+    fn clone_box(&self) -> Box<dyn RaftPeerRouter> {
+        Box::new(self.clone())
+    }
+    fn report_snapshot_status(
+        &self,
+        region_id: u64,
+        to_peer_id: u64,
+        status: SnapshotStatus,
+    ) -> RaftStoreResult<()> {
+        self.significant_send(
+            region_id,
+            SignificantMsg::SnapshotStatus {
+                region_id,
+                to_peer_id,
+                status,
+            },
+        )
+    }
+}
 
+impl RaftStoreRouter<RocksEngine> for MockRaftStoreRouter {
     fn significant_send(
         &self,
         region_id: u64,

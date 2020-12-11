@@ -16,15 +16,32 @@ use crate::store::{
 };
 use crate::{DiscardReason, Error as RaftStoreError, Result as RaftStoreResult};
 
+pub trait RaftPeerRouter: StoreRouter + Send {
+    /// Sends RaftMessage to local store.
+    fn send_raft_msg(&self, msg: RaftMessage) -> RaftStoreResult<()>;
+    fn clone_box(&self) -> Box<dyn RaftPeerRouter>;
+    /// Broadcast an `StoreUnreachable` event to all Raft groups.
+    fn broadcast_unreachable(&self, store_id: u64) {
+        let _ = self.send(StoreMsg::StoreUnreachable { store_id });
+    }
+
+    /// Reports the sending snapshot status to the peer of the Region.
+    fn report_snapshot_status(&self, _: u64, _: u64, _: SnapshotStatus) -> RaftStoreResult<()> {
+        Ok(())
+    }
+
+    /// Reports the peer being unreachable to the Region.
+    fn report_unreachable(&self, _: u64, _: u64) -> RaftStoreResult<()> {
+        Ok(())
+    }
+}
+
 /// Routes messages to the raftstore.
 pub trait RaftStoreRouter<EK>:
-    StoreRouter<EK> + ProposalRouter<EK::Snapshot> + CasualRouter<EK> + Send + Clone
+    ProposalRouter<EK::Snapshot> + CasualRouter<EK> + RaftPeerRouter + Send + Clone
 where
     EK: KvEngine,
 {
-    /// Sends RaftMessage to local store.
-    fn send_raft_msg(&self, msg: RaftMessage) -> RaftStoreResult<()>;
-
     /// Sends a significant message. We should guarantee that the message can't be dropped.
     fn significant_send(
         &self,
@@ -41,8 +58,8 @@ where
     }
 
     /// Send a store message to the backend raft batch system.
-    fn send_store_msg(&self, msg: StoreMsg<EK>) -> RaftStoreResult<()> {
-        <Self as StoreRouter<EK>>::send(self, msg)
+    fn send_store_msg(&self, msg: StoreMsg) -> RaftStoreResult<()> {
+        <Self as StoreRouter>::send(self, msg)
     }
 
     /// Sends RaftCmdRequest to local store.
@@ -51,35 +68,6 @@ where
         let cmd = RaftCommand::new(req, cb);
         <Self as ProposalRouter<EK::Snapshot>>::send(self, cmd)
             .map_err(|e| handle_send_error(region_id, e))
-    }
-
-    /// Reports the peer being unreachable to the Region.
-    fn report_unreachable(&self, region_id: u64, to_peer_id: u64) -> RaftStoreResult<()> {
-        let msg = SignificantMsg::Unreachable {
-            region_id,
-            to_peer_id,
-        };
-        self.significant_send(region_id, msg)
-    }
-
-    /// Reports the sending snapshot status to the peer of the Region.
-    fn report_snapshot_status(
-        &self,
-        region_id: u64,
-        to_peer_id: u64,
-        status: SnapshotStatus,
-    ) -> RaftStoreResult<()> {
-        let msg = SignificantMsg::SnapshotStatus {
-            region_id,
-            to_peer_id,
-            status,
-        };
-        self.significant_send(region_id, msg)
-    }
-
-    /// Broadcast an `StoreUnreachable` event to all Raft groups.
-    fn broadcast_unreachable(&self, store_id: u64) {
-        let _ = self.send_store_msg(StoreMsg::StoreUnreachable { store_id });
     }
 
     /// Report a `StoreResolved` event to all Raft groups.
@@ -119,12 +107,19 @@ impl<S: Snapshot> ProposalRouter<S> for RaftStoreBlackHole {
     }
 }
 
-impl<EK> StoreRouter<EK> for RaftStoreBlackHole
-where
-    EK: KvEngine,
-{
-    fn send(&self, _: StoreMsg<EK>) -> RaftStoreResult<()> {
+impl StoreRouter for RaftStoreBlackHole {
+    fn send(&self, _: StoreMsg) -> RaftStoreResult<()> {
         Ok(())
+    }
+}
+
+impl RaftPeerRouter for RaftStoreBlackHole {
+    /// Sends RaftMessage to local store.
+    fn send_raft_msg(&self, _: RaftMessage) -> RaftStoreResult<()> {
+        Ok(())
+    }
+    fn clone_box(&self) -> Box<dyn RaftPeerRouter> {
+        Box::new(RaftStoreBlackHole)
     }
 }
 
@@ -132,11 +127,6 @@ impl<EK> RaftStoreRouter<EK> for RaftStoreBlackHole
 where
     EK: KvEngine,
 {
-    /// Sends RaftMessage to local store.
-    fn send_raft_msg(&self, _: RaftMessage) -> RaftStoreResult<()> {
-        Ok(())
-    }
-
     /// Sends a significant message. We should guarantee that the message can't be dropped.
     fn significant_send(&self, _: u64, _: SignificantMsg<EK::Snapshot>) -> RaftStoreResult<()> {
         Ok(())
@@ -174,8 +164,8 @@ impl<EK: KvEngine, ER: RaftEngine> ServerRaftStoreRouter<EK, ER> {
     }
 }
 
-impl<EK: KvEngine, ER: RaftEngine> StoreRouter<EK> for ServerRaftStoreRouter<EK, ER> {
-    fn send(&self, msg: StoreMsg<EK>) -> RaftStoreResult<()> {
+impl<EK: KvEngine, ER: RaftEngine> StoreRouter for ServerRaftStoreRouter<EK, ER> {
+    fn send(&self, msg: StoreMsg) -> RaftStoreResult<()> {
         StoreRouter::send(&self.router, msg)
     }
 }
@@ -195,11 +185,40 @@ impl<EK: KvEngine, ER: RaftEngine> CasualRouter<EK> for ServerRaftStoreRouter<EK
     }
 }
 
-impl<EK: KvEngine, ER: RaftEngine> RaftStoreRouter<EK> for ServerRaftStoreRouter<EK, ER> {
+impl<EK: KvEngine, ER: RaftEngine> RaftPeerRouter for ServerRaftStoreRouter<EK, ER> {
     fn send_raft_msg(&self, msg: RaftMessage) -> RaftStoreResult<()> {
-        RaftStoreRouter::send_raft_msg(&self.router, msg)
+        self.router.send_raft_msg(msg)
+    }
+    fn clone_box(&self) -> Box<dyn RaftPeerRouter> {
+        Box::new(self.clone())
     }
 
+    fn report_snapshot_status(
+        &self,
+        region_id: u64,
+        to_peer_id: u64,
+        status: SnapshotStatus,
+    ) -> RaftStoreResult<()> {
+        let msg = SignificantMsg::SnapshotStatus {
+            region_id,
+            to_peer_id,
+            status,
+        };
+        self.significant_send(region_id, msg)
+    }
+
+    fn report_unreachable(&self, region_id: u64, to_peer_id: u64) -> RaftStoreResult<()> {
+        self.significant_send(
+            region_id,
+            SignificantMsg::Unreachable {
+                region_id,
+                to_peer_id,
+            },
+        )
+    }
+}
+
+impl<EK: KvEngine, ER: RaftEngine> RaftStoreRouter<EK> for ServerRaftStoreRouter<EK, ER> {
     /// Sends a significant message. We should guarantee that the message can't be dropped.
     fn significant_send(
         &self,
@@ -240,13 +259,42 @@ pub fn handle_send_error<T>(region_id: u64, e: TrySendError<T>) -> RaftStoreErro
     }
 }
 
-impl<EK: KvEngine, ER: RaftEngine> RaftStoreRouter<EK> for RaftRouter<EK, ER> {
+impl<EK: KvEngine, ER: RaftEngine> RaftPeerRouter for RaftRouter<EK, ER> {
     fn send_raft_msg(&self, msg: RaftMessage) -> RaftStoreResult<()> {
         let region_id = msg.get_region_id();
         self.send_raft_message(msg)
             .map_err(|e| handle_send_error(region_id, e))
     }
+    fn clone_box(&self) -> Box<dyn RaftPeerRouter> {
+        Box::new(self.clone())
+    }
 
+    fn report_snapshot_status(
+        &self,
+        region_id: u64,
+        to_peer_id: u64,
+        status: SnapshotStatus,
+    ) -> RaftStoreResult<()> {
+        let msg = SignificantMsg::SnapshotStatus {
+            region_id,
+            to_peer_id,
+            status,
+        };
+        self.significant_send(region_id, msg)
+    }
+
+    fn report_unreachable(&self, region_id: u64, to_peer_id: u64) -> RaftStoreResult<()> {
+        self.significant_send(
+            region_id,
+            SignificantMsg::Unreachable {
+                region_id,
+                to_peer_id,
+            },
+        )
+    }
+}
+
+impl<EK: KvEngine, ER: RaftEngine> RaftStoreRouter<EK> for RaftRouter<EK, ER> {
     fn significant_send(
         &self,
         region_id: u64,

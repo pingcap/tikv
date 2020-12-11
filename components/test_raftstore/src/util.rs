@@ -581,7 +581,7 @@ pub fn create_test_engine(
             router
                 .lock()
                 .unwrap()
-                .send_control(StoreMsg::CompactedEvent(event))
+                .send_control(StoreMsg::CompactedEvent(Box::new(event)))
                 .unwrap();
         });
         kv_db_opt.add_event_listener(CompactionListener::new(
