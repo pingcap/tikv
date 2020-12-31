@@ -5,7 +5,7 @@ use super::key_handle::{KeyHandle, KeyHandleGuard};
 use crossbeam_skiplist::SkipMap;
 use std::{
     ops::Bound,
-    sync::{Arc, Weak},
+    sync::{atomic, Arc, Weak},
 };
 use txn_types::{Key, Lock};
 
@@ -21,13 +21,20 @@ impl Default for LockTable {
 impl LockTable {
     pub async fn lock_key(&self, key: &Key) -> KeyHandleGuard {
         loop {
-            let handle = Arc::new(KeyHandle::new(key.clone(), self.clone()));
+            let handle = Arc::new(KeyHandle::new(key.clone()));
             let weak = Arc::downgrade(&handle);
             let weak2 = weak.clone();
             let guard = handle.lock().await;
-
+            atomic::fence(atomic::Ordering::SeqCst);
             let entry = self.0.get_or_insert(key.clone(), weak);
+            atomic::fence(atomic::Ordering::SeqCst);
             if entry.value().ptr_eq(&weak2) {
+                // SAFETY: The `table` field in `KeyHandle` is only accessed through the `set_table`
+                // or the `drop` method. It's impossible to have a concurrent `drop` here and `set_table`
+                // is only called here. So there is no concurrent access to the `table` field in `KeyHandle`.
+                unsafe {
+                    guard.handle().set_table(self.clone());
+                }
                 return guard;
             } else if let Some(handle) = entry.value().upgrade() {
                 return handle.lock().await;
@@ -72,7 +79,10 @@ impl LockTable {
 
     /// Gets the handle of the key.
     pub fn get(&self, key: &Key) -> Option<Arc<KeyHandle>> {
-        self.0.get(key).and_then(|e| e.value().upgrade())
+        atomic::fence(atomic::Ordering::SeqCst);
+        let res = self.0.get(key).and_then(|e| e.value().upgrade());
+        atomic::fence(atomic::Ordering::SeqCst);
+        res
     }
 
     /// Finds the first handle in the given range that `pred` returns `Some`.
@@ -86,6 +96,7 @@ impl LockTable {
         let lower_bound = start_key.map(Bound::Included).unwrap_or(Bound::Unbounded);
         let upper_bound = end_key.map(Bound::Excluded).unwrap_or(Bound::Unbounded);
 
+        atomic::fence(atomic::Ordering::SeqCst);
         for e in self.0.range((lower_bound, upper_bound)) {
             let res = e.value().upgrade().and_then(&mut pred);
             if res.is_some() {
@@ -97,6 +108,7 @@ impl LockTable {
 
     /// Iterates all handles and call a specified function on each of them.
     pub fn for_each(&self, mut f: impl FnMut(Arc<KeyHandle>)) {
+        atomic::fence(atomic::Ordering::SeqCst);
         for entry in self.0.iter() {
             if let Some(handle) = entry.value().upgrade() {
                 f(handle);
@@ -106,7 +118,9 @@ impl LockTable {
 
     /// Removes the key and its key handle from the map.
     pub fn remove(&self, key: &Key) {
+        atomic::fence(atomic::Ordering::SeqCst);
         self.0.remove(key);
+        atomic::fence(atomic::Ordering::SeqCst);
     }
 }
 
@@ -298,5 +312,20 @@ mod test {
 
         lock_table.for_each(|h| collect(h, &mut found_locks));
         assert_eq!(found_locks, expect_locks);
+    }
+
+    #[tokio::test]
+    async fn test_lock_key_when_handle_exists() {
+        let lock_table: LockTable = LockTable::default();
+        let key = Key::from_raw(b"key");
+        let guard = lock_table.lock_key(&key).await;
+        let handle = lock_table.get(&key).unwrap();
+        drop(guard);
+
+        let guard2 = lock_table.lock_key(&key).await;
+        drop(handle);
+
+        let handle = lock_table.get(&key).unwrap();
+        assert_eq!(Arc::as_ptr(&handle), Arc::as_ptr(guard2.handle()));
     }
 }

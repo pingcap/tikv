@@ -392,6 +392,7 @@ fn async_commit_timestamps<S: Snapshot>(
 
         lock.min_commit_ts = min_commit_ts;
         *l = Some(lock.clone());
+        info!("set memory lock"; "key" => ?key, "lock" => ?lock);
         Ok(min_commit_ts)
     })?;
 
