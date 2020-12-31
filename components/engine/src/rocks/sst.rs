@@ -8,6 +8,7 @@ use super::{
     SequentialFile, DB,
 };
 use crate::{CfName, CF_DEFAULT};
+use engine_rocksdb::rocksdb::supported_compression;
 use engine_rocksdb::{SstFileReader, SstFileWriter};
 
 /// A builder builds a SstWriter.
@@ -15,6 +16,7 @@ pub struct SstWriterBuilder {
     cf: Option<CfName>,
     db: Option<Arc<DB>>,
     in_memory: bool,
+    compression_type: Option<DBCompressionType>,
 }
 
 impl SstWriterBuilder {
@@ -24,6 +26,7 @@ impl SstWriterBuilder {
             cf: None,
             in_memory: false,
             db: None,
+            compression_type: None,
         }
     }
 
@@ -42,6 +45,12 @@ impl SstWriterBuilder {
     /// Set it to true, the builder builds a in-memory SST builder.
     pub fn set_in_memory(mut self, in_memory: bool) -> Self {
         self.in_memory = in_memory;
+        self
+    }
+
+    /// Set SST compression algorithm
+    pub fn set_compression_type(mut self, compression_type: Option<DBCompressionType>) -> Self {
+        self.compression_type = compression_type;
         self
     }
 
@@ -65,7 +74,19 @@ impl SstWriterBuilder {
         } else if let Some(env) = env.as_ref() {
             io_options.set_env(env.clone());
         }
-        io_options.compression(get_fastest_supported_compression_type());
+        let compress_type = if let Some(ct) = self.compression_type {
+            let all_supported_compression = supported_compression();
+            if !all_supported_compression.contains(&ct) {
+                return Err(format!(
+                    "compression type '{}' is not supported by rocksdb",
+                    fmt_db_compression_type(ct)
+                ));
+            }
+            ct
+        } else {
+            get_fastest_supported_compression_type()
+        };
+        io_options.compression(compress_type);
         // in rocksdb 5.5.1, SstFileWriter will try to use bottommost_compression and
         // compression_per_level first, so to make sure our specified compression type
         // being used, we must set them empty or disabled.
@@ -74,6 +95,15 @@ impl SstWriterBuilder {
         let mut writer = SstFileWriter::new(EnvOptions::new(), io_options);
         writer.open(path)?;
         Ok(SstWriter { writer, env })
+    }
+}
+
+fn fmt_db_compression_type(ct: DBCompressionType) -> &'static str {
+    match ct {
+        DBCompressionType::Lz4 => "lz4",
+        DBCompressionType::Snappy => "snappy",
+        DBCompressionType::Zstd => "zstd",
+        _ => unreachable!(),
     }
 }
 

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use engine::rocks::{SstWriter, SstWriterBuilder};
+use engine::rocks::{DBCompressionType, SstWriter, SstWriterBuilder};
 use engine::{CfName, CF_DEFAULT, CF_WRITE, DB};
 use external_storage::ExternalStorage;
 use futures_util::io::AllowStdIo;
@@ -119,16 +119,23 @@ pub struct BackupWriter {
 
 impl BackupWriter {
     /// Create a new BackupWriter.
-    pub fn new(db: Arc<DB>, name: &str, limiter: Limiter) -> Result<BackupWriter> {
+    pub fn new(
+        db: Arc<DB>,
+        name: &str,
+        limiter: Limiter,
+        compression_type: Option<DBCompressionType>,
+    ) -> Result<BackupWriter> {
         let default = SstWriterBuilder::new()
             .set_in_memory(true)
             .set_cf(CF_DEFAULT)
             .set_db(db.clone())
+            .set_compression_type(compression_type)
             .build(name)?;
         let write = SstWriterBuilder::new()
             .set_in_memory(true)
             .set_cf(CF_WRITE)
             .set_db(db.clone())
+            .set_compression_type(compression_type)
             .build(name)?;
         let name = name.to_owned();
         Ok(BackupWriter {
@@ -211,11 +218,18 @@ pub struct BackupRawKVWriter {
 
 impl BackupRawKVWriter {
     /// Create a new BackupRawKVWriter.
-    pub fn new(db: Arc<DB>, name: &str, cf: CfName, limiter: Limiter) -> Result<BackupRawKVWriter> {
+    pub fn new(
+        db: Arc<DB>,
+        name: &str,
+        cf: CfName,
+        limiter: Limiter,
+        compression_type: Option<DBCompressionType>,
+    ) -> Result<BackupRawKVWriter> {
         let writer = SstWriterBuilder::new()
             .set_in_memory(true)
             .set_cf(cf)
             .set_db(db)
+            .set_compression_type(compression_type)
             .build(name)?;
         Ok(BackupRawKVWriter {
             name: name.to_owned(),
@@ -326,12 +340,14 @@ mod tests {
         let storage = external_storage::create_storage(&backend).unwrap();
 
         // Test empty file.
-        let mut writer = BackupWriter::new(db.clone(), "foo", Limiter::new(INFINITY)).unwrap();
+        let mut writer =
+            BackupWriter::new(db.clone(), "foo", Limiter::new(INFINITY), None).unwrap();
         writer.write(vec![].into_iter(), false).unwrap();
         assert!(writer.save(&storage).unwrap().is_empty());
 
         // Test write only txn.
-        let mut writer = BackupWriter::new(db.clone(), "foo1", Limiter::new(INFINITY)).unwrap();
+        let mut writer =
+            BackupWriter::new(db.clone(), "foo1", Limiter::new(INFINITY), None).unwrap();
         writer
             .write(
                 vec![TxnEntry::Commit {
@@ -350,7 +366,7 @@ mod tests {
         );
 
         // Test write and default.
-        let mut writer = BackupWriter::new(db, "foo2", Limiter::new(INFINITY)).unwrap();
+        let mut writer = BackupWriter::new(db, "foo2", Limiter::new(INFINITY), None).unwrap();
         writer
             .write(
                 vec![

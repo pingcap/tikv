@@ -8,6 +8,7 @@ use std::sync::atomic::*;
 use std::sync::*;
 use std::time::*;
 
+use engine::rocks::DBCompressionType;
 use engine::{name_to_cf, CfName, IterOption, DATA_KEY_PREFIX_LEN, DB};
 use external_storage::*;
 use futures::channel::mpsc::*;
@@ -44,6 +45,7 @@ struct Request {
     cancel: Arc<AtomicBool>,
     is_raw_kv: bool,
     cf: CfName,
+    compress_type: CompressionType,
 }
 
 /// Backup Task.
@@ -109,6 +111,7 @@ impl Task {
                 cancel: cancel.clone(),
                 is_raw_kv: req.get_is_raw_kv(),
                 cf,
+                compress_type: req.get_compression_type(),
             },
             concurrency: req.get_concurrency(),
             resp,
@@ -260,14 +263,16 @@ impl BackupRange {
         file_name: String,
         backup_ts: u64,
         start_ts: u64,
+        compression_type: Option<DBCompressionType>,
     ) -> Result<(Vec<File>, Statistics)> {
-        let mut writer = match BackupWriter::new(db, &file_name, storage.limiter.clone()) {
-            Ok(w) => w,
-            Err(e) => {
-                error!("backup writer failed"; "error" => ?e);
-                return Err(e);
-            }
-        };
+        let mut writer =
+            match BackupWriter::new(db, &file_name, storage.limiter.clone(), compression_type) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("backup writer failed"; "error" => ?e);
+                    return Err(e);
+                }
+            };
         let stat = match self.backup(&mut writer, engine, backup_ts, start_ts) {
             Ok(s) => s,
             Err(e) => return Err(e),
@@ -289,14 +294,16 @@ impl BackupRange {
         storage: &LimitedStorage,
         file_name: String,
         cf: CfName,
+        ct: Option<DBCompressionType>,
     ) -> Result<(Vec<File>, Statistics)> {
-        let mut writer = match BackupRawKVWriter::new(db, &file_name, cf, storage.limiter.clone()) {
-            Ok(w) => w,
-            Err(e) => {
-                error!("backup writer failed"; "error" => ?e);
-                return Err(e);
-            }
-        };
+        let mut writer =
+            match BackupRawKVWriter::new(db, &file_name, cf, storage.limiter.clone(), ct) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("backup writer failed"; "error" => ?e);
+                    return Err(e);
+                }
+            };
         let stat = match self.backup_raw(&mut writer, engine) {
             Ok(s) => s,
             Err(e) => return Err(e),
@@ -557,11 +564,20 @@ impl<E: Engine, R: RegionInfoProvider> Endpoint<E, R> {
                     tikv_util::file::sha256(&input).ok().map(|b| hex::encode(b))
                 });
                 let name = backup_file_name(store_id, &brange.region, key);
+                let ct = to_sst_compression_type(request.compress_type);
 
                 let res = if is_raw_kv {
-                    brange.backup_raw_kv_to_file(&engine, db.clone(), &storage, name, cf)
+                    brange.backup_raw_kv_to_file(&engine, db.clone(), &storage, name, cf, ct)
                 } else {
-                    brange.backup_to_file(&engine, db.clone(), &storage, name, backup_ts, start_ts)
+                    brange.backup_to_file(
+                        &engine,
+                        db.clone(),
+                        &storage,
+                        name,
+                        backup_ts,
+                        start_ts,
+                        ct,
+                    )
                 };
                 match res {
                     Err(e) => {
@@ -764,6 +780,16 @@ fn backup_file_name(store_id: u64, region: &Region, key: Option<String>) -> Stri
     }
 }
 
+// convert BackupCompresionType to rocks db DBCompressionType
+fn to_sst_compression_type(ct: CompressionType) -> Option<DBCompressionType> {
+    match ct {
+        CompressionType::LZ4 => Some(DBCompressionType::Lz4),
+        CompressionType::SNAPPY => Some(DBCompressionType::Snappy),
+        CompressionType::ZSTD => Some(DBCompressionType::Zstd),
+        CompressionType::UNKNOWN => None,
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -935,6 +961,7 @@ pub mod tests {
                         cancel: Arc::default(),
                         is_raw_kv: false,
                         cf: engine::CF_DEFAULT,
+                        compress_type: CompressionType::UNKNOWN,
                     },
                     resp: tx,
                     concurrency: 4,
