@@ -270,14 +270,11 @@ impl StatsMonitor {
     }
 
     pub fn stop(&mut self) {
-        let h = self.handle.take();
-        if h.is_none() {
-            return;
-        }
-        drop(self.sender.take().unwrap());
-        if let Err(e) = h.unwrap().join() {
-            error!("join stats collector failed"; "err" => ?e);
-            return;
+        if let Some(h) = self.handle.take() {
+            drop(self.sender.take());
+            if let Err(e) = h.join() {
+                error!("join stats collector failed"; "err" => ?e);
+            }
         }
     }
 }
@@ -381,6 +378,11 @@ impl<T: PdClient> Runner<T> {
         right_derive: bool,
         callback: Callback,
     ) {
+        if split_keys.is_empty() {
+            info!("empty split key, skip ask batch split";
+                "region_id" => region.get_id());
+            return;
+        }
         let router = self.router.clone();
         let scheduler = self.scheduler.clone();
         let f = self
