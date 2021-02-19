@@ -680,8 +680,9 @@ where
                 self.ctx
                     .insert_pending_delete_range(region_id, &start_key, &end_key);
 
-                // try to delete stale ranges if there are any
-                if !self.ctx.ingest_maybe_stall() {
+                // Try to delete stale ranges if there are any.
+                // But we shall deal the pending apply task at first.
+                if !self.ctx.ingest_maybe_stall() && self.pending_applies.is_empty() {
                     self.ctx.clean_stale_ranges();
                 }
             }
