@@ -879,7 +879,7 @@ mod tests {
         worker.start_with_timer(runner);
         thread::sleep(Duration::from_millis(20));
         drop(snap);
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(2000));
         assert!(engine.kv.get_value(b"k1").unwrap().is_none());
         assert_eq!(engine.kv.get_value(b"k2").unwrap().unwrap(), b"v2");
         for i in 0..9 {
