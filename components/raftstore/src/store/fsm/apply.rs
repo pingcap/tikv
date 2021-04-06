@@ -15,7 +15,9 @@ use std::time::Duration;
 use std::vec::Drain;
 use std::{cmp, usize};
 
-use batch_system::{BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHandler};
+use batch_system::{
+    BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHandler, Priority,
+};
 use collections::{HashMap, HashMapEntry, HashSet};
 use crossbeam::channel::{TryRecvError, TrySendError};
 use engine_traits::PerfContext;
@@ -344,7 +346,6 @@ where
     kv_wb_last_bytes: u64,
     kv_wb_last_keys: u64,
 
-    last_applied_index: u64,
     committed_count: usize,
 
     // Whether synchronize WAL is preferred.
@@ -368,6 +369,7 @@ where
     /// happened before `WriteBatch::write` and after `SSTImporter::delete`. We shall make sure that
     /// this entry will never apply again at first, then we can delete the ssts files.
     delete_ssts: Vec<SstMeta>,
+    priority: Priority,
 }
 
 impl<EK, W> ApplyContext<EK, W>
@@ -386,6 +388,7 @@ where
         cfg: &Config,
         store_id: u64,
         pending_create_peers: Arc<Mutex<HashMap<u64, (u64, bool)>>>,
+        priority: Priority,
     ) -> ApplyContext<EK, W> {
         // If `enable_multi_batch_write` was set true, we create `RocksWriteBatchVec`.
         // Otherwise create `RocksWriteBatch`.
@@ -405,7 +408,6 @@ where
             apply_res: vec![],
             kv_wb_last_bytes: 0,
             kv_wb_last_keys: 0,
-            last_applied_index: 0,
             committed_count: 0,
             sync_log_hint: false,
             exec_ctx: None,
@@ -415,6 +417,7 @@ where
             delete_ssts: vec![],
             store_id,
             pending_create_peers,
+            priority,
         }
     }
 
@@ -425,7 +428,6 @@ where
     /// After all delegates are handled, `write_to_db` method should be called.
     pub fn prepare_for(&mut self, delegate: &mut ApplyDelegate<EK>) {
         self.cbs.push(ApplyCallback::new(delegate.region.clone()));
-        self.last_applied_index = delegate.apply_state.get_applied_index();
 
         if let Some(observe_cmd) = &delegate.observe_cmd {
             let region_id = delegate.region_id();
@@ -439,7 +441,7 @@ where
     ///
     /// This call is valid only when it's between a `prepare_for` and `finish_for`.
     pub fn commit(&mut self, delegate: &mut ApplyDelegate<EK>) {
-        if self.last_applied_index < delegate.apply_state.get_applied_index() {
+        if delegate.last_sync_apply_index < delegate.apply_state.get_applied_index() {
             delegate.write_apply_state(self.kv_wb_mut());
         }
         // last_applied_index doesn't need to be updated, set persistent to true will
@@ -452,6 +454,7 @@ where
         if persistent {
             self.write_to_db();
             self.prepare_for(delegate);
+            delegate.last_sync_apply_index = delegate.apply_state.get_applied_index();
         }
         self.kv_wb_last_bytes = self.kv_wb().data_size() as u64;
         self.kv_wb_last_keys = self.kv_wb().count() as u64;
@@ -537,11 +540,11 @@ where
 
     /// Flush all pending writes to engines.
     /// If it returns true, all pending writes are persisted in engines.
-    pub fn flush(&mut self) -> bool {
+    pub fn flush(&mut self) {
         // TODO: this check is too hacky, need to be more verbose and less buggy.
         let t = match self.timer.take() {
             Some(t) => t,
-            None => return false,
+            None => return,
         };
 
         // Write to engine
@@ -549,7 +552,7 @@ where
         // take raft log gc for example, we write kv WAL first, then write raft WAL,
         // if power failure happen, raft WAL may synced to disk, but kv WAL may not.
         // so we use sync-log flag here.
-        let is_synced = self.write_to_db();
+        self.write_to_db();
 
         if !self.apply_res.is_empty() {
             let apply_res = std::mem::replace(&mut self.apply_res, vec![]);
@@ -566,7 +569,6 @@ where
             self.committed_count
         );
         self.committed_count = 0;
-        is_synced
     }
 }
 
@@ -622,7 +624,10 @@ fn should_write_to_engine(cmd: &RaftCmdRequest) -> bool {
             _ => {}
         }
     }
+    false
+}
 
+fn has_high_latency_operation(cmd: &RaftCmdRequest) -> bool {
     // Some commands may modify keys covered by the current write batch, so we
     // must write the current write batch to the engine first.
     for req in cmd.get_requests() {
@@ -786,6 +791,8 @@ where
 
     /// The local metrics, and it will be flushed periodically.
     metrics: ApplyMetrics,
+
+    priority: Priority,
 }
 
 impl<EK> ApplyDelegate<EK>
@@ -813,6 +820,7 @@ where
             last_merge_version: 0,
             pending_request_snapshot_count: reg.pending_request_snapshot_count,
             observe_cmd: None,
+            priority: Priority::Normal,
         }
     }
 
@@ -931,7 +939,20 @@ where
         if !data.is_empty() {
             let cmd = util::parse_data_at(data, index, &self.tag);
 
-            if should_write_to_engine(&cmd) || apply_ctx.kv_wb().should_write_to_engine() {
+            let low_prioty_request = has_high_latency_operation(&cmd);
+            if low_prioty_request {
+                let has_unsync_data =
+                    self.last_sync_apply_index != self.apply_state.get_applied_index();
+                if apply_ctx.priority != Priority::Low {
+                    if has_unsync_data {
+                        apply_ctx.commit(self);
+                    }
+                    self.priority = Priority::Low;
+                    return ApplyResult::Yield;
+                } else if has_unsync_data || apply_ctx.kv_wb().should_write_to_engine() {
+                    apply_ctx.commit(self);
+                }
+            } else if should_write_to_engine(&cmd) || apply_ctx.kv_wb().should_write_to_engine() {
                 apply_ctx.commit(self);
                 if let Some(start) = self.handle_start.as_ref() {
                     if start.elapsed() >= apply_ctx.yield_duration {
@@ -1307,8 +1328,7 @@ where
                 CmdType::Put => self.handle_put(ctx.kv_wb_mut(), req),
                 CmdType::Delete => self.handle_delete(ctx.kv_wb_mut(), req),
                 CmdType::DeleteRange => {
-                    assert!(ctx.kv_wb.is_empty());
-                    self.handle_delete_range(&ctx.engine, req, &mut ranges, ctx.use_delete_range)
+                    self.handle_delete_range(ctx, req, &mut ranges, ctx.use_delete_range)
                 }
                 CmdType::IngestSst => {
                     assert!(ctx.kv_wb.is_empty());
@@ -1455,9 +1475,9 @@ where
         Ok(resp)
     }
 
-    fn handle_delete_range(
+    fn handle_delete_range<W: WriteBatch<EK>>(
         &mut self,
-        engine: &EK,
+        ctx: &mut ApplyContext<EK, W>,
         req: &Request,
         ranges: &mut Vec<Range>,
         use_delete_range: bool,
@@ -1504,20 +1524,21 @@ where
                     e
                 )
             };
-            engine
+            ctx.engine
                 .delete_ranges_cf(cf, DeleteStrategy::DeleteFiles, &range)
                 .unwrap_or_else(|e| fail_f(e, DeleteStrategy::DeleteFiles));
 
-            let strategy = if use_delete_range {
-                DeleteStrategy::DeleteByRange
-            } else {
-                DeleteStrategy::DeleteByKey
-            };
             // Delete all remaining keys.
-            engine
-                .delete_ranges_cf(cf, strategy.clone(), &range)
-                .unwrap_or_else(move |e| fail_f(e, strategy));
-            engine
+            if use_delete_range {
+                ctx.engine
+                    .delete_ranges_cf(cf, DeleteStrategy::DeleteByRange, &range)
+                    .unwrap_or_else(move |e| fail_f(e, DeleteStrategy::DeleteByRange));
+            } else {
+                ctx.engine
+                    .delete_ranges_cf(cf, DeleteStrategy::DeleteByKey, &range)
+                    .unwrap_or_else(move |e| fail_f(e, DeleteStrategy::DeleteByKey));
+            };
+            ctx.engine
                 .delete_ranges_cf(cf, DeleteStrategy::DeleteBlobs, &range)
                 .unwrap_or_else(move |e| fail_f(e, DeleteStrategy::DeleteBlobs));
         }
@@ -3323,6 +3344,10 @@ where
                     if channel_timer.is_none() {
                         channel_timer = Some(start);
                     }
+                    // If there is any apply task, we change this fsm to normal-priority.
+                    // When it meets a ingest-request or a delete-range request, it will change to
+                    // low-priority
+                    self.delegate.priority = Priority::Normal;
                     self.handle_apply(apply_ctx, apply);
                     if let Some(ref mut state) = self.delegate.yield_state {
                         state.pending_msgs = drainer.collect();
@@ -3379,6 +3404,10 @@ where
         Self: Sized,
     {
         self.mailbox.take()
+    }
+
+    fn get_priority(&self) -> Priority {
+        self.delegate.priority
     }
 }
 
@@ -3500,12 +3529,14 @@ where
     }
 
     fn end(&mut self, fsms: &mut [Box<ApplyFsm<EK>>]) {
-        let is_synced = self.apply_ctx.flush();
-        if is_synced {
-            for fsm in fsms {
-                fsm.delegate.last_sync_apply_index = fsm.delegate.apply_state.get_applied_index();
-            }
+        self.apply_ctx.flush();
+        for fsm in fsms {
+            fsm.delegate.last_sync_apply_index = fsm.delegate.apply_state.get_applied_index();
         }
+    }
+
+    fn get_priority(&self) -> Priority {
+        self.apply_ctx.priority
     }
 }
 
@@ -3555,7 +3586,7 @@ where
 {
     type Handler = ApplyPoller<EK, W>;
 
-    fn build(&mut self) -> ApplyPoller<EK, W> {
+    fn build(&mut self, priority: Priority) -> ApplyPoller<EK, W> {
         let cfg = self.cfg.value();
         ApplyPoller {
             msg_buf: Vec::with_capacity(cfg.messages_per_tick),
@@ -3570,6 +3601,7 @@ where
                 &cfg,
                 self.store_id,
                 self.pending_create_peers.clone(),
+                priority,
             ),
             messages_per_tick: cfg.messages_per_tick,
             cfg_tracker: self.cfg.clone().tracker(self.tag.clone()),
