@@ -71,15 +71,16 @@ use crate::storage::{
     lock_manager::{DummyLockManager, LockManager},
     metrics::*,
     mvcc::PointGetterBuilder,
-    raw::ttl::convert_to_expire_ts,
     txn::{commands::TypedCommand, scheduler::Scheduler as TxnScheduler, Command},
     types::StorageCallbackType,
 };
 use concurrency_manager::ConcurrencyManager;
+use engine_traits::util::convert_to_expire_ts;
 use engine_traits::{CfName, CF_DEFAULT, DATA_CFS};
 use futures::prelude::*;
 use kvproto::kvrpcpb::{
-    CommandPri, Context, GetRequest, IsolationLevel, KeyRange, LockInfo, RawGetRequest,
+    ChecksumAlgorithm, CommandPri, Context, GetRequest, IsolationLevel, KeyRange, LockInfo,
+    RawGetRequest,
 };
 use raftstore::store::util::build_key_range;
 use rand::prelude::*;
@@ -1634,6 +1635,61 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         let cmd = RawAtomicStore::new(cf, muations, None, ctx);
         self.sched_txn_command(cmd, callback)
     }
+
+    pub fn raw_checksum(
+        &self,
+        ctx: Context,
+        algorithm: ChecksumAlgorithm,
+        ranges: Vec<KeyRange>,
+    ) -> impl Future<Output = Result<(u64, u64, u64)>> {
+        const CMD: CommandKind = CommandKind::raw_checksum;
+        let priority = ctx.get_priority();
+        let priority_tag = get_priority_tag(priority);
+        let enable_ttl = self.enable_ttl;
+
+        let res = self.read_pool.spawn_handle(
+            async move {
+                KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
+                SCHED_COMMANDS_PRI_COUNTER_VEC_STATIC
+                    .get(priority_tag)
+                    .inc();
+
+                if algorithm != ChecksumAlgorithm::Crc64Xor {
+                    return Err(box_err!("unknown checksum algorithm {:?}", algorithm));
+                }
+
+                let command_duration = tikv_util::time::Instant::now_coarse();
+                let snap_ctx = SnapContext {
+                    pb_ctx: &ctx,
+                    ..Default::default()
+                };
+                let snapshot =
+                    Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await?;
+                let begin_instant = tikv_util::time::Instant::now_coarse();
+                let ret = if enable_ttl {
+                    let snap = TTLSnapshot::from(snapshot);
+                    raw::raw_checksum_ranges(snap, ranges).await
+                } else {
+                    raw::raw_checksum_ranges(snapshot, ranges).await
+                };
+                SCHED_PROCESSING_READ_HISTOGRAM_STATIC
+                    .get(CMD)
+                    .observe(begin_instant.elapsed_secs());
+                SCHED_HISTOGRAM_VEC_STATIC
+                    .get(CMD)
+                    .observe(command_duration.elapsed_secs());
+
+                ret
+            },
+            priority,
+            thread_rng().next_u64(),
+        );
+
+        async move {
+            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
+                .await?
+        }
+    }
 }
 
 fn get_priority_tag(priority: CommandPri) -> CommandPriority {
@@ -1935,11 +1991,11 @@ mod tests {
         kv::{Error as EngineError, ErrorInner as EngineErrorInner},
         lock_manager::{Lock, WaitTimeout},
         mvcc::{Error as MvccError, ErrorInner as MvccErrorInner},
-        raw::ttl::current_ts,
         txn::{commands, Error as TxnError, ErrorInner as TxnErrorInner},
     };
     use collections::HashMap;
     use engine_rocks::raw_util::CFOptions;
+    use engine_traits::util::current_ts;
     use engine_traits::{ALL_CFS, CF_LOCK, CF_RAFT, CF_WRITE};
     use errors::extract_key_error;
     use futures::executor::block_on;
