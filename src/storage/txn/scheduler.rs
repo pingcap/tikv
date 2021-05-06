@@ -53,6 +53,7 @@ use crate::storage::{
     get_priority_tag, types::StorageCallback, Error as StorageError,
     ErrorInner as StorageErrorInner,
 };
+use ctx::{Ctx, FutureExt, Tags, M_TXN};
 
 const TASKS_SLOTS_NUM: usize = 1 << 12; // 4096 slots.
 
@@ -101,6 +102,8 @@ struct TaskContext {
     latch_timer: Instant,
     // Total duration of a command.
     _cmd_timer: CmdTimer,
+
+    pub tags: Option<Tags>,
 }
 
 impl TaskContext {
@@ -129,6 +132,7 @@ impl TaskContext {
                 tag,
                 begin: Instant::now_coarse(),
             },
+            tags: None,
         }
     }
 
@@ -231,10 +235,12 @@ impl<L: LockManager> SchedulerInner<L> {
     fn acquire_lock(&self, cid: u64) -> Option<Task> {
         let mut task_slot = self.get_task_slot(cid);
         let tctx = task_slot.get_mut(&cid).unwrap();
+        Ctx::extend_tags(M_TXN, tctx.tags.take().unwrap());
         if self.latches.acquire(&mut tctx.lock, cid) {
             tctx.on_schedule();
             return tctx.task.take();
         }
+        tctx.tags = Some(Ctx::extract_tags(M_TXN));
         None
     }
 }
@@ -335,6 +341,7 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
             self.execute(task);
             return;
         }
+        tctx.tags = Some(Ctx::extract_tags(M_TXN));
         fail_point!("txn_scheduler_acquire_fail");
     }
 
@@ -365,6 +372,8 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
 
         let cb = must_call(
             move |(cb_ctx, snapshot)| {
+                let _handle = Ctx::enter_module(M_TXN);
+
                 debug!(
                     "receive snapshot finish msg";
                     "cid" => task.cid, "cb_ctx" => ?cb_ctx
@@ -393,9 +402,12 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
                             .get_sched_pool(task.cmd.priority())
                             .clone()
                             .pool
-                            .spawn(async move {
-                                sched.finish_with_err(task.cid, Error::from(err));
-                            })
+                            .spawn(
+                                async move {
+                                    sched.finish_with_err(task.cid, Error::from(err));
+                                }
+                                .in_tags(M_TXN, Ctx::extract_tags(M_TXN)),
+                            )
                             .unwrap();
                     }
                 }
@@ -439,6 +451,7 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
         };
         tctx.cb.unwrap().execute(pr);
 
+        let _ = Ctx::extract_tags(M_TXN);
         self.release_lock(&tctx.lock, cid);
     }
 
@@ -559,38 +572,41 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
         self.get_sched_pool(task.cmd.priority())
             .clone()
             .pool
-            .spawn(async move {
-                fail_point!("scheduler_async_snapshot_finish");
-                SCHED_STAGE_COUNTER_VEC.get(tag).process.inc();
+            .spawn(
+                async move {
+                    fail_point!("scheduler_async_snapshot_finish");
+                    SCHED_STAGE_COUNTER_VEC.get(tag).process.inc();
 
-                let read_duration = Instant::now_coarse();
+                    let read_duration = Instant::now_coarse();
 
-                let region_id = task.cmd.ctx().get_region_id();
-                let ts = task.cmd.ts();
-                let timer = Instant::now_coarse();
-                let mut statistics = Statistics::default();
+                    let region_id = task.cmd.ctx().get_region_id();
+                    let ts = task.cmd.ts();
+                    let timer = Instant::now_coarse();
+                    let mut statistics = Statistics::default();
 
-                if task.cmd.readonly() {
-                    self.process_read(snapshot, task, &mut statistics);
-                } else {
-                    // Safety: `self.sched_pool` ensures a TLS engine exists.
-                    unsafe {
-                        with_tls_engine(|engine| {
-                            self.process_write(engine, snapshot, task, &mut statistics)
-                        });
-                    }
-                };
-                tls_collect_scan_details(tag.get_str(), &statistics);
-                slow_log!(
-                    timer.elapsed(),
-                    "[region {}] scheduler handle command: {}, ts: {}",
-                    region_id,
-                    tag,
-                    ts
-                );
+                    if task.cmd.readonly() {
+                        self.process_read(snapshot, task, &mut statistics);
+                    } else {
+                        // Safety: `self.sched_pool` ensures a TLS engine exists.
+                        unsafe {
+                            with_tls_engine(|engine| {
+                                self.process_write(engine, snapshot, task, &mut statistics)
+                            });
+                        }
+                    };
+                    tls_collect_scan_details(tag.get_str(), &statistics);
+                    slow_log!(
+                        timer.elapsed(),
+                        "[region {}] scheduler handle command: {}, ts: {}",
+                        region_id,
+                        tag,
+                        ts
+                    );
 
-                tls_collect_read_duration(tag.get_str(), read_duration.elapsed());
-            })
+                    tls_collect_read_duration(tag.get_str(), read_duration.elapsed());
+                }
+                .in_tags(M_TXN, Ctx::extract_tags(M_TXN)),
+            )
             .unwrap();
     }
 

@@ -77,6 +77,7 @@ use crate::store::{
 };
 use crate::Result;
 use concurrency_manager::ConcurrencyManager;
+use ctx::{Ctx, M_RAFT};
 use tikv_util::future::poll_future_notify;
 
 type Key = Vec<u8>;
@@ -792,6 +793,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> PollHandler<PeerFsm<EK, ER>, St
     }
 
     fn handle_normal(&mut self, peer: &mut PeerFsm<EK, ER>) -> Option<usize> {
+        let _handle = Ctx::enter_module(M_RAFT);
         let mut expected_msg_count = None;
 
         fail_point!(

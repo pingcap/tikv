@@ -27,6 +27,7 @@ use crate::storage::kv::{
     ExtCallback, Modify, SnapContext, WriteData,
 };
 use crate::storage::{self, kv};
+use ctx::{Ctx, M_RAFT};
 use raftstore::{coprocessor::dispatcher::BoxReadIndexObserver, store::RegionSnapshot};
 use raftstore::{
     coprocessor::Coprocessor,
@@ -396,6 +397,8 @@ where
         proposed_cb: Option<ExtCallback>,
         committed_cb: Option<ExtCallback>,
     ) -> kv::Result<()> {
+        let _handle = Ctx::inherit_module(M_RAFT);
+
         fail_point!("raftkv_async_write");
         if batch.modifies.is_empty() {
             return Err(KvError::from(KvErrorInner::EmptyRequest));
@@ -439,6 +442,8 @@ where
     }
 
     fn async_snapshot(&self, mut ctx: SnapContext<'_>, cb: Callback<Self::Snap>) -> kv::Result<()> {
+        let _handle = Ctx::inherit_module(M_RAFT);
+
         fail_point!("raftkv_async_snapshot_err", |_| Err(box_err!(
             "injected error for async_snapshot"
         )));

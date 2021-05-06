@@ -76,6 +76,7 @@ use crate::storage::{
     types::StorageCallbackType,
 };
 use concurrency_manager::ConcurrencyManager;
+use ctx::{Ctx, M_TXN};
 use engine_traits::{CfName, CF_DEFAULT, DATA_CFS};
 use futures::prelude::*;
 use kvproto::kvrpcpb::{
@@ -871,6 +872,8 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         cmd: TypedCommand<T>,
         callback: Callback<T>,
     ) -> Result<()> {
+        let _handle = Ctx::inherit_module(M_TXN);
+
         use crate::storage::txn::commands::{
             AcquirePessimisticLock, Prewrite, PrewritePessimistic,
         };

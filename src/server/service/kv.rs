@@ -23,6 +23,7 @@ use crate::storage::{
     SecondaryLocksStatus, Storage, TxnStatus,
 };
 use crate::{forward_duplex, forward_unary};
+use ctx::{Ctx, FutureExt as _, Tag, M_GRPC};
 use engine_rocks::RocksEngine;
 use futures::compat::Future01CompatExt;
 use futures::future::{self, Future, FutureExt, TryFutureExt};
@@ -133,6 +134,10 @@ macro_rules! handle_request {
             forward_unary!(self.proxy, $fn_name, ctx, req, sink);
             let begin_instant = Instant::now_coarse();
 
+            let _handle = Ctx::enter_module(M_GRPC);
+            let tag = Tag::new(stringify!($fn_name).to_owned());
+            Ctx::push_tag(M_GRPC, tag);
+
             let resp = $future_name(&self.storage, req);
             let task = async move {
                 let resp = resp.await?;
@@ -151,7 +156,7 @@ macro_rules! handle_request {
             })
             .map(|_|());
 
-            ctx.spawn(task);
+            ctx.spawn(task.in_tags(M_GRPC, Ctx::extract_tags(M_GRPC)));
         }
     }
 }
