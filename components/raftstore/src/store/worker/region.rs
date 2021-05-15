@@ -38,14 +38,7 @@ const GENERATE_POOL_SIZE: usize = 2;
 
 // used to periodically check whether we should delete a stale peer's range in region runner
 
-#[cfg(test)]
-pub const STALE_PEER_CHECK_TICK: usize = 1; // 1000 milliseconds
-
-#[cfg(not(test))]
 pub const STALE_PEER_CHECK_TICK: usize = 10; // 10000 milliseconds
-
-// used to periodically check whether schedule pending applies in region runner
-pub const PENDING_APPLY_CHECK_INTERVAL: u64 = 1_000; // 1000 milliseconds
 
 const CLEANUP_MAX_REGION_COUNT: usize = 128;
 
@@ -394,6 +387,8 @@ where
 
     /// Tries to apply the snapshot of the specified Region. It calls `apply_snap` to do the actual work.
     fn handle_apply(&mut self, region_id: u64, status: Arc<AtomicUsize>) {
+        fail_point!("region::handle_apply");
+        fail_point!("region::handle_apply_return", |_| {});
         let _ = status.compare_exchange(
             JOB_STATUS_PENDING,
             JOB_STATUS_RUNNING,
@@ -506,6 +501,7 @@ where
 
     /// Cleans up stale ranges.
     fn clean_stale_ranges(&mut self) {
+        fail_point!("region::clean_stale_ranges");
         STALE_PEER_PENDING_DELETE_RANGE_GAUGE.set(self.pending_delete_ranges.len() as f64);
 
         let oldest_sequence = self
@@ -546,6 +542,7 @@ where
     /// Checks the number of files at level 0 to avoid write stall after ingesting sst.
     /// Returns true if the ingestion causes write stall.
     fn ingest_maybe_stall(&self) -> bool {
+        fail_point!("region::ingest_maybe_stall", |_| true);
         for cf in SNAPSHOT_CFS {
             // no need to check lock cf
             if plain_file_used(cf) {
@@ -601,6 +598,7 @@ where
         use_delete_range: bool,
         coprocessor_host: CoprocessorHost<EK>,
         router: R,
+        clean_stale_check_interval: Duration,
     ) -> Runner<EK, R> {
         Runner {
             pool: Builder::new(thd_name!("snap-generator"))
@@ -617,7 +615,7 @@ where
             },
             pending_applies: VecDeque::new(),
             clean_stale_tick: 0,
-            clean_stale_check_interval: Duration::from_millis(PENDING_APPLY_CHECK_INTERVAL),
+            clean_stale_check_interval,
         }
     }
 
@@ -694,8 +692,9 @@ where
                 self.ctx
                     .insert_pending_delete_range(region_id, &start_key, &end_key);
 
-                // try to delete stale ranges if there are any
-                if !self.ctx.ingest_maybe_stall() {
+                // Try to delete stale ranges if there are any.
+                // But we shall deal the pending apply task at first.
+                if !self.ctx.ingest_maybe_stall() && self.pending_applies.is_empty() {
                     self.ctx.clean_stale_ranges();
                 }
             }
@@ -715,8 +714,14 @@ where
     fn on_timeout(&mut self) {
         self.handle_pending_applies();
         self.clean_stale_tick += 1;
-        if self.clean_stale_tick >= STALE_PEER_CHECK_TICK {
-            self.ctx.clean_stale_ranges();
+        if self.clean_stale_tick >= STALE_PEER_CHECK_TICK
+            && self.pending_applies.is_empty()
+            && !self.ctx.ingest_maybe_stall()
+        {
+            // try to delete stale ranges if there are any
+            if self.ctx.pending_delete_ranges.len() > 0 {
+                self.ctx.clean_stale_ranges();
+            }
             self.clean_stale_tick = 0;
         }
     }
@@ -845,15 +850,15 @@ mod tests {
         let mut worker: LazyWorker<Task<KvTestSnapshot>> = bg_worker.lazy_build("region-worker");
         let sched = worker.scheduler();
         let (router, _) = mpsc::sync_channel(11);
-        let mut runner = RegionRunner::new(
+        let runner = RegionRunner::new(
             engine.kv.clone(),
             mgr,
             0,
             false,
             CoprocessorHost::<KvTestEngine>::default(),
             router,
+            Duration::from_millis(100),
         );
-        runner.clean_stale_check_interval = Duration::from_millis(100);
 
         let mut ranges = vec![];
         for i in 0..10 {
@@ -885,7 +890,7 @@ mod tests {
         worker.start_with_timer(runner);
         thread::sleep(Duration::from_millis(20));
         drop(snap);
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(2000));
         assert!(engine.kv.get_value(b"k1").unwrap().is_none());
         assert_eq!(engine.kv.get_value(b"k2").unwrap().unwrap(), b"v2");
         for i in 0..9 {
@@ -950,6 +955,7 @@ mod tests {
             true,
             CoprocessorHost::<KvTestEngine>::default(),
             router,
+            Duration::from_millis(200),
         );
         worker.start_with_timer(runner);
 

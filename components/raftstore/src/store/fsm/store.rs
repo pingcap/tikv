@@ -86,6 +86,9 @@ const RAFT_WB_SHRINK_SIZE: usize = 1024 * 1024;
 pub const PENDING_MSG_CAP: usize = 100;
 const UNREACHABLE_BACKOFF: Duration = Duration::from_secs(10);
 
+// used to periodically check whether schedule pending applies in region runner
+pub const PENDING_APPLY_CHECK_INTERVAL: Duration = Duration::from_secs(1); // 1 second
+
 pub struct StoreInfo<E> {
     pub engine: E,
     pub capacity: u64,
@@ -1188,6 +1191,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             cfg.value().use_delete_range,
             workers.coprocessor_host.clone(),
             self.router(),
+            PENDING_APPLY_CHECK_INTERVAL,
         );
         let region_scheduler = workers
             .region_worker

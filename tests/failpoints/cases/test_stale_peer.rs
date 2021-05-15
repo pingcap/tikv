@@ -1,13 +1,23 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::*;
 
 use engine_rocks::Compat;
+use engine_test::kv::{new_engine, KvTestEngine, KvTestSnapshot};
 use engine_traits::Peekable;
+use engine_traits::ALL_CFS;
 use kvproto::raft_serverpb::RaftLocalState;
+use raftstore::coprocessor::CoprocessorHost;
+use raftstore::store::RegionRunner;
+use raftstore::store::RegionTask;
+use raftstore::store::SnapManager;
+use tempfile::Builder;
 use test_raftstore::*;
 use tikv_util::config::ReadableDuration;
+use tikv_util::worker::{LazyWorker, Worker};
 
 #[test]
 fn test_one_node_leader_missing() {
@@ -128,4 +138,80 @@ fn test_stale_learner_restart() {
     fail::remove("on_handle_apply_1003");
     cluster.run_node(2).unwrap();
     must_get_equal(&cluster.get_engine(2), b"k2", b"v2");
+}
+
+#[test]
+fn test_not_clean_stale_peer_when_writestall() {
+    let path = Builder::new()
+        .prefix("test_not_clean_stale_peer_when_writestall")
+        .tempdir()
+        .unwrap();
+    let engine = new_engine(
+        path.path().join("db").to_str().unwrap(),
+        None,
+        ALL_CFS,
+        None,
+    )
+    .unwrap();
+
+    let snap_dir = Builder::new().prefix("snap_dir").tempdir().unwrap();
+    let mgr = SnapManager::new(snap_dir.path().to_str().unwrap());
+    let bg_worker = Worker::new("region-worker");
+    let mut worker: LazyWorker<RegionTask<KvTestSnapshot>> = bg_worker.lazy_build("region-worker");
+    let sched = worker.scheduler();
+    let (router, _) = std::sync::mpsc::sync_channel(11);
+    let runner = RegionRunner::new(
+        engine,
+        mgr,
+        0,
+        false,
+        CoprocessorHost::<KvTestEngine>::default(),
+        router,
+        Duration::from_millis(100),
+    );
+    worker.start_with_timer(runner);
+    let mut ranges = vec![];
+    for i in 0..10 {
+        let mut key = b"k0".to_vec();
+        key.extend_from_slice(i.to_string().as_bytes());
+        ranges.push(key);
+    }
+    fail::cfg("region::ingest_maybe_stall", "return()").unwrap();
+    let destroy_count = Arc::new(AtomicUsize::new(0));
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let d = destroy_count.clone();
+    fail::cfg_callback("region::clean_stale_ranges", move || {
+        d.fetch_add(1, Ordering::SeqCst);
+    })
+    .unwrap();
+    let a = apply_count.clone();
+    fail::cfg_callback("region::handle_apply", move || {
+        a.fetch_add(1, Ordering::SeqCst);
+    })
+    .unwrap();
+    for i in 0..8 {
+        sched
+            .schedule(RegionTask::Destroy {
+                region_id: i as u64 + 2,
+                start_key: ranges[i].clone(),
+                end_key: ranges[i + 1].clone(),
+            })
+            .unwrap();
+    }
+    sched
+        .schedule(RegionTask::Apply {
+            region_id: 8,
+            status: Arc::new(AtomicUsize::new(0)),
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(2000));
+    assert_eq!(0, destroy_count.load(Ordering::Acquire));
+    assert_eq!(0, apply_count.load(Ordering::Acquire));
+
+    fail::remove("region::ingest_maybe_stall");
+    fail::cfg("region::handle_apply_return", "return()").unwrap();
+    std::thread::sleep(Duration::from_millis(1600));
+    assert_eq!(1, destroy_count.load(Ordering::Acquire));
+    assert_eq!(1, apply_count.load(Ordering::Acquire));
+    worker.stop_worker();
 }

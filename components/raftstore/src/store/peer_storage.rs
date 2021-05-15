@@ -2069,6 +2069,7 @@ mod tests {
             true,
             CoprocessorHost::<KvTestEngine>::default(),
             router,
+            Duration::from_millis(1000),
         );
         worker.start_with_timer(runner);
         let snap = s.snapshot(0);
@@ -2394,6 +2395,7 @@ mod tests {
             true,
             CoprocessorHost::<KvTestEngine>::default(),
             router,
+            Duration::from_millis(1000),
         );
         worker.start(runner);
         assert!(s1.snapshot(0).is_err());
