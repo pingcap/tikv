@@ -34,7 +34,7 @@ use engine_rocks::{
 };
 use engine_traits::{
     compaction_job::CompactionJobInfo, CFOptionsExt, ColumnFamilyOptions, Engines, MiscExt,
-    RaftEngine, CF_DEFAULT, CF_LOCK, CF_WRITE,
+    RaftEngine, CF_DEFAULT, CF_LOCK, CF_WRITE, KvEngine,
 };
 use error_code::ErrorCodeExt;
 use file_system::{
@@ -177,7 +177,7 @@ struct TiKVServer<ER: RaftEngine> {
     store_path: PathBuf,
     snap_mgr: Option<SnapManager>, // Will be filled in `init_servers`.
     encryption_key_manager: Option<Arc<DataKeyManager>>,
-    engines: Option<TiKVEngines<ER>>,
+    engines: Option<TiKVEngines<RocksEngine, ER>>,
     servers: Option<Servers<ER>>,
     region_info_accessor: RegionInfoAccessor,
     coprocessor_host: Option<CoprocessorHost<RocksEngine>>,
@@ -188,10 +188,10 @@ struct TiKVServer<ER: RaftEngine> {
     background_worker: Worker,
 }
 
-struct TiKVEngines<ER: RaftEngine> {
-    engines: Engines<RocksEngine, ER>,
+struct TiKVEngines<EK: KvEngine, ER: RaftEngine> {
+    engines: Engines<EK, ER>,
     store_meta: Arc<Mutex<StoreMeta>>,
-    engine: RaftKv<RocksEngine, ServerRaftStoreRouter<RocksEngine, ER>>,
+    engine: RaftKv<EK, ServerRaftStoreRouter<EK, ER>>,
 }
 
 struct Servers<ER: RaftEngine> {
@@ -1428,10 +1428,10 @@ impl<R: RaftEngine> EngineMetricsManager<R> {
     }
 
     pub fn flush(&mut self, now: Instant) {
-        self.engines.kv.flush_metrics("kv");
+        KvEngine::flush_metrics(&self.engines.kv, "kv");
         self.engines.raft.flush_metrics("raft");
         if now.duration_since(self.last_reset) >= DEFAULT_ENGINE_METRICS_RESET_INTERVAL {
-            self.engines.kv.reset_statistics();
+            KvEngine::reset_statistics(&self.engines.kv);
             self.engines.raft.reset_statistics();
             self.last_reset = now;
         }
