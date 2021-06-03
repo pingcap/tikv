@@ -4939,7 +4939,7 @@
           "steppedLine": false,
           "targets": [
             {
-              "expr": "sum(rate(tikv_thread_cpu_seconds_total{tidb_cluster=\"$tidb_cluster\", instance=~\"$instance\", name=~\"unified_read_po*\"}[1m])) by (instance)",
+              "expr": "sum(rate(tikv_thread_cpu_seconds_total{tidb_cluster=\"$tidb_cluster\", instance=~\"$instance\", name=~\"unified_read*\"}[1m])) by (instance)",
               "format": "time_series",
               "interval": "",
               "intervalFactor": 2,
@@ -5082,7 +5082,7 @@
           "steppedLine": false,
           "targets": [
             {
-              "expr": "sum(rate(tikv_thread_cpu_seconds_total{tidb_cluster=\"$tidb_cluster\", instance=~\"$instance\", name=~\"store_read_norm.*\"}[1m])) by (instance)",
+              "expr": "sum(rate(tikv_thread_cpu_seconds_total{tidb_cluster=\"$tidb_cluster\", instance=~\"$instance\", name=~\"store_read_nl.*\"}[1m])) by (instance)",
               "format": "time_series",
               "intervalFactor": 2,
               "legendFormat": "{{instance}} - normal",
@@ -5091,7 +5091,7 @@
               "step": 4
             },
             {
-              "expr": "sum(rate(tikv_thread_cpu_seconds_total{tidb_cluster=\"$tidb_cluster\", instance=~\"$instance\", name=~\"store_read_high.*\"}[1m])) by (instance)",
+              "expr": "sum(rate(tikv_thread_cpu_seconds_total{tidb_cluster=\"$tidb_cluster\", instance=~\"$instance\", name=~\"store_read_hi.*\"}[1m])) by (instance)",
               "format": "time_series",
               "intervalFactor": 2,
               "legendFormat": "{{instance}} - high",
@@ -5100,7 +5100,7 @@
               "step": 4
             },
             {
-              "expr": "sum(rate(tikv_thread_cpu_seconds_total{tidb_cluster=\"$tidb_cluster\", instance=~\"$instance\", name=~\"store_read_low.*\"}[1m])) by (instance)",
+              "expr": "sum(rate(tikv_thread_cpu_seconds_total{tidb_cluster=\"$tidb_cluster\", instance=~\"$instance\", name=~\"store_read_lo.*\"}[1m])) by (instance)",
               "format": "time_series",
               "intervalFactor": 2,
               "legendFormat": "{{instance}} - low",
@@ -11121,7 +11121,7 @@
           "steppedLine": false,
           "targets": [
             {
-              "expr": "sum(rate(tikv_multilevel_level_elapsed{tidb_cluster=\"$tidb_cluster\", instance=~\"$instance\", name=\"unified-read-pool\"}[1m])) by (level)",
+              "expr": "sum(rate(tikv_multilevel_level_elapsed{tidb_cluster=\"$tidb_cluster\", instance=~\"$instance\", name=\"unified-read\"}[1m])) by (level)",
               "format": "time_series",
               "intervalFactor": 1,
               "legendFormat": "{{level}}",
@@ -11209,7 +11209,7 @@
           "steppedLine": false,
           "targets": [
             {
-              "expr": "tikv_multilevel_level0_chance{tidb_cluster=\"$tidb_cluster\", instance=~\"$instance\", name=\"unified-read-pool\"}",
+              "expr": "tikv_multilevel_level0_chance{tidb_cluster=\"$tidb_cluster\", instance=~\"$instance\", name=\"unified-read\"}",
               "format": "time_series",
               "intervalFactor": 1,
               "legendFormat": "{{instance}}",
