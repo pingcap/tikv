@@ -4229,6 +4229,7 @@ dependencies = [
  "crossbeam",
  "encryption",
  "encryption_export",
+ "engine_panic",
  "engine_rocks",
  "engine_traits",
  "error_code",
