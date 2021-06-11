@@ -1223,11 +1223,13 @@ where EK: KvEngine + CreateKvEngine<ER>,
     }
 }
 
-impl TiKVServer<RocksEngine, RocksEngine> {
+impl<EK> TiKVServer<EK, RocksEngine>
+where EK: KvEngine + CreateKvEngine<RocksEngine>
+{
     fn init_raw_engines(
         &mut self,
         limiter: Option<Arc<IORateLimiter>>,
-    ) -> (Engines<RocksEngine, RocksEngine>, Arc<EnginesResourceInfo<RocksEngine>>) {
+    ) -> (Engines<EK, RocksEngine>, Arc<EnginesResourceInfo<EK>>) {
         let env =
             get_encrypted_env(self.encryption_key_manager.clone(), None /*base_env*/).unwrap();
         let env = get_inspected_env(Some(env), limiter).unwrap();
@@ -1277,13 +1279,15 @@ impl TiKVServer<RocksEngine, RocksEngine> {
     }
 }
 
-impl TiKVServer<RocksEngine, RaftLogEngine> {
+impl<EK> TiKVServer<EK, RaftLogEngine>
+where EK: KvEngine + CreateKvEngine<RaftLogEngine>
+{
     fn init_raw_engines(
         &mut self,
         limiter: Option<Arc<IORateLimiter>>,
     ) -> (
-        Engines<RocksEngine, RaftLogEngine>,
-        Arc<EnginesResourceInfo<RocksEngine>>,
+        Engines<EK, RaftLogEngine>,
+        Arc<EnginesResourceInfo<EK>>,
     ) {
         let env =
             get_encrypted_env(self.encryption_key_manager.clone(), None /*base_env*/).unwrap();
