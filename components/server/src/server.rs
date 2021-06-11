@@ -1172,6 +1172,18 @@ impl<ER: RaftEngine> TiKVServer<RocksEngine, ER> {
 
         kv_engine
     }
+
+    fn register_kv_config(&mut self, kv_engine: RocksEngine) {
+        let cfg_controller = self.cfg_controller.as_mut().unwrap();
+        cfg_controller.register(
+            tikv::config::Module::Rocksdb,
+            Box::new(DBConfigManger::new(
+                kv_engine,
+                DBType::Kv,
+                self.config.storage.block_cache.shared,
+            )),
+        );
+    }
 }
 
 impl TiKVServer<RocksEngine, RocksEngine> {
@@ -1206,15 +1218,9 @@ impl TiKVServer<RocksEngine, RocksEngine> {
 
         check_and_dump_raft_engine(&self.config, &engines.raft, 8);
 
+        self.register_kv_config(engines.kv.clone());
+
         let cfg_controller = self.cfg_controller.as_mut().unwrap();
-        cfg_controller.register(
-            tikv::config::Module::Rocksdb,
-            Box::new(DBConfigManger::new(
-                engines.kv.clone(),
-                DBType::Kv,
-                self.config.storage.block_cache.shared,
-            )),
-        );
         cfg_controller.register(
             tikv::config::Module::Raftdb,
             Box::new(DBConfigManger::new(
@@ -1257,15 +1263,7 @@ impl TiKVServer<RocksEngine, RaftLogEngine> {
         let kv_engine = self.create_kv_engine(env, &block_cache);
         let engines = Engines::new(kv_engine, raft_engine);
 
-        let cfg_controller = self.cfg_controller.as_mut().unwrap();
-        cfg_controller.register(
-            tikv::config::Module::Rocksdb,
-            Box::new(DBConfigManger::new(
-                engines.kv.clone(),
-                DBType::Kv,
-                self.config.storage.block_cache.shared,
-            )),
-        );
+        self.register_kv_config(engines.kv.clone());
 
         let engines_info = Arc::new(EnginesResourceInfo::new(
             engines.kv.clone(),
