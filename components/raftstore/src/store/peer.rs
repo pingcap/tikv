@@ -301,9 +301,15 @@ impl CmdEpochChecker {
 
 impl Drop for CmdEpochChecker {
     fn drop(&mut self) {
-        for state in self.proposed_admin_cmd.drain(..) {
-            for cb in state.cbs {
-                apply::notify_stale_req(self.term, cb);
+        if tikv_util::thread_group::is_shutdown(!cfg!(test)) {
+            for mut state in self.proposed_admin_cmd.drain(..) {
+                state.cbs.clear();
+            }
+        } else {
+            for state in self.proposed_admin_cmd.drain(..) {
+                for cb in state.cbs {
+                    apply::notify_stale_req(self.term, cb);
+                }
             }
         }
     }
@@ -1526,6 +1532,7 @@ impl Peer {
         ctx: &mut PollContext<T, C>,
         ready: &mut CollectedReady,
     ) {
+<<<<<<< HEAD
         // Call `handle_raft_committed_entries` directly here may lead to inconsistency.
         // In some cases, there will be some pending committed entries when applying a
         // snapshot. If we call `handle_raft_committed_entries` directly, these updates
@@ -1556,6 +1563,41 @@ impl Peer {
                         self.maybe_renew_leader_lease(propose_time, ctx, None);
                         lease_to_be_updated = false;
                     }
+=======
+        fail_point!(
+            "before_leader_handle_committed_entries",
+            self.is_leader(),
+            |_| ()
+        );
+
+        assert!(
+            !self.is_applying_snapshot(),
+            "{} is applying snapshot when it is ready to handle committed entries",
+            self.tag
+        );
+        if !committed_entries.is_empty() {
+            // We must renew current_time because this value may be created a long time ago.
+            // If we do not renew it, this time may be smaller than propose_time of a command,
+            // which was proposed in another thread while this thread receives its AppendEntriesResponse
+            // and is ready to calculate its commit-log-duration.
+            ctx.current_time.replace(monotonic_raw_now());
+        }
+        // Leader needs to update lease.
+        let mut lease_to_be_updated = self.is_leader();
+        for entry in committed_entries.iter().rev() {
+            // raft meta is very small, can be ignored.
+            self.raft_log_size_hint += entry.get_data().len() as u64;
+            if lease_to_be_updated {
+                let propose_time = self
+                    .proposals
+                    .find_propose_time(entry.get_term(), entry.get_index());
+                if let Some(propose_time) = propose_time {
+                    ctx.raft_metrics.commit_log.observe(duration_to_sec(
+                        (ctx.current_time.unwrap() - propose_time).to_std().unwrap(),
+                    ));
+                    self.maybe_renew_leader_lease(propose_time, ctx, None);
+                    lease_to_be_updated = false;
+>>>>>>> bfc3c47d3... raftstore: skip clearing callback when shutdown (#10364)
                 }
 
                 fail_point!(

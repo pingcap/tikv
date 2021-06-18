@@ -309,10 +309,16 @@ impl StatsMonitor {
         self.sender = Some(sender);
 
         let scheduler = self.scheduler.clone();
+        let props = tikv_util::thread_group::current_properties();
 
         let h = Builder::new()
             .name(thd_name!("stats-monitor"))
             .spawn(move || {
+<<<<<<< HEAD
+=======
+                tikv_util::thread_group::set_properties(props);
+                tikv_alloc::add_thread_memory_accessor();
+>>>>>>> bfc3c47d3... raftstore: skip clearing callback when shutdown (#10364)
                 let mut thread_stats = ThreadInfoStatistics::new();
                 while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(collect_interval) {
                     if timer_cnt % thread_info_interval == 0 {
