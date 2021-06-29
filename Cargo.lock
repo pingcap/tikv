@@ -3316,7 +3316,7 @@ dependencies = [
 [[package]]
 name = "raft"
 version = "0.6.0-alpha"
-source = "git+https://github.com/tikv/raft-rs?branch=master#b84afe99b5e54b10a306ec844d1b83ae8a7a3c31"
+source = "git+https://github.com/gengliqi/raft-rs?branch=add-entries-size#823bc81bb2c6bede65db1fe41fdb07e516446362"
 dependencies = [
  "bytes 1.0.1",
  "fxhash",
@@ -3350,7 +3350,7 @@ dependencies = [
 [[package]]
 name = "raft-proto"
 version = "0.6.0-alpha"
-source = "git+https://github.com/tikv/raft-rs?branch=master#b84afe99b5e54b10a306ec844d1b83ae8a7a3c31"
+source = "git+https://github.com/gengliqi/raft-rs?branch=add-entries-size#823bc81bb2c6bede65db1fe41fdb07e516446362"
 dependencies = [
  "bytes 1.0.1",
  "lazy_static",
@@ -3423,6 +3423,7 @@ dependencies = [
  "raft",
  "raft-proto",
  "rand 0.8.3",
+ "seahash",
  "serde",
  "serde_derive",
  "serde_with",

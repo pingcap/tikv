@@ -548,7 +548,9 @@ where
             .on_flush_applied_cmd_batch(batch_max_level, cmd_batch, &self.engine);
         // Invoke callbacks
         for (cb, resp) in cb_batch.drain(..) {
-            cb.invoke_with_response(resp)
+            if let Some(scheduled_ts) = cb.invoke_with_response(resp) {
+                APPLY_TIME_HISTOGRAM.observe(duration_to_sec(scheduled_ts.elapsed()));
+            }
         }
         need_sync
     }
@@ -2846,6 +2848,15 @@ impl<S: Snapshot> Apply<S> {
             cbs,
         }
     }
+
+    pub fn on_schedule(&mut self) {
+        for cb in &mut self.cbs {
+            if let Callback::Write { cb, .. } = &mut cb.cb {
+                STORE_TIME_HISTOGRAM.observe(duration_to_sec(cb.1.elapsed()) as f64);
+                cb.1 = std::time::Instant::now();
+            }
+        }
+    }
 }
 
 pub struct Registration {
@@ -2874,6 +2885,7 @@ impl Registration {
     }
 }
 
+#[derive(Debug)]
 pub struct Proposal<S>
 where
     S: Snapshot,

@@ -202,11 +202,16 @@ fn test_serde_custom_tikv_config() {
         local_read_batch_size: 33,
         apply_batch_system,
         store_batch_system,
+        store_io_pool_size: 5,
         future_poll_size: 2,
         hibernate_regions: false,
         dev_assert: true,
         apply_yield_duration: ReadableDuration::millis(333),
         perf_level: PerfLevel::EnableTime,
+        cmd_batch: false,
+        trigger_ready_size: ReadableSize::mb(12),
+        trigger_write_size: ReadableSize::mb(34),
+        store_waterfall_metrics: true,
     };
     value.pd = PdConfig::new(vec!["example.com:443".to_owned()]);
     let titan_cf_config = TitanCfConfig {
