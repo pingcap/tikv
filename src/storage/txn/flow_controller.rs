@@ -720,20 +720,19 @@ impl<E: Engine> FlowChecker<E> {
         let is_throttled = self.limiter.speed_limit() != INFINITY;
         let should_throttle = checker.last_num_l0_files > self.l0_files_threshold;
 
-        let throttle = if !is_throttled && should_throttle {
+        if !is_throttled && should_throttle {
             SCHED_THROTTLE_ACTION_COUNTER
                 .with_label_values(&[&cf, "init"])
                 .inc();
             self.throttle_cf = Some(cf.clone());
             let x = self.recorder.get_percentile_95();
-            if x == 0 { INFINITY } else { x as f64 }
+            self.update_speed_limit(if x == 0 { INFINITY } else { x as f64 })
         } else if is_throttled && should_throttle {
             match checker.long_term_num_l0_files.trend() {
                 Trend::OnlyOne => {
                     SCHED_THROTTLE_ACTION_COUNTER
                         .with_label_values(&[&cf, "down2"])
                         .inc();
-                    self.limiter.speed_limit()
                 }
                 Trend::Increasing => {
                     SCHED_THROTTLE_ACTION_COUNTER
@@ -743,19 +742,16 @@ impl<E: Engine> FlowChecker<E> {
                         self.last_target_file = Some(checker.last_num_l0_files);
                         self.l0_target_flow = checker.short_term_flush_flow.get_avg();
                     }
-                    self.limiter.speed_limit()
                 }
                 Trend::Decreasing => {
                     SCHED_THROTTLE_ACTION_COUNTER
                         .with_label_values(&[&cf, "keep_decr"])
                         .inc();
-                    self.limiter.speed_limit()
                 }
                 Trend::NoTrend => {
                     SCHED_THROTTLE_ACTION_COUNTER
                         .with_label_values(&[&cf, "keep"])
                         .inc();
-                    self.limiter.speed_limit()
                 }
             }
         } else if is_throttled && !should_throttle {
@@ -763,19 +759,16 @@ impl<E: Engine> FlowChecker<E> {
                 SCHED_THROTTLE_ACTION_COUNTER
                     .with_label_values(&[&cf, "keep2"])
                     .inc();
-                self.limiter.speed_limit()
             } else if checker.long_term_num_l0_files.get_recent() as f64
                 >= self.l0_files_threshold as f64 * 0.5
             {
                 SCHED_THROTTLE_ACTION_COUNTER
                     .with_label_values(&[&cf, "keep3"])
                     .inc();
-                self.limiter.speed_limit()
             } else if checker.last_num_l0_files_from_flush >= self.l0_files_threshold {
                 SCHED_THROTTLE_ACTION_COUNTER
                     .with_label_values(&[&cf, "keep4"])
                     .inc();
-                self.limiter.speed_limit()
             } else {
                 if self.last_target_file.is_some()
                     && checker.short_term_flush_flow.get_avg() < self.l0_target_flow
@@ -783,19 +776,14 @@ impl<E: Engine> FlowChecker<E> {
                     SCHED_THROTTLE_ACTION_COUNTER
                         .with_label_values(&[&cf, "up"])
                         .inc();
-                    self.limiter.speed_limit() * (1.0 + LIMIT_UP_PERCENT)
+                    self.update_flow(cf)
                 } else {
                     SCHED_THROTTLE_ACTION_COUNTER
                         .with_label_values(&[&cf, "up_keep"])
                         .inc();
-                    self.limiter.speed_limit()
                 }
             }
-        } else {
-            INFINITY
-        };
-
-        self.update_speed_limit(throttle)
+        }
     }
 
     fn update_speed_limit(&mut self, mut throttle: f64) {
@@ -888,7 +876,7 @@ impl<E: Engine> FlowChecker<E> {
                         SCHED_THROTTLE_ACTION_COUNTER
                             .with_label_values(&[&cf, "down_flow"])
                             .inc();
-                        self.down_flow(cf);
+                        self.update_flow(cf);
                     } else if checker.long_term_num_l0_files.get_avg()
                         > last_target_file as f64 + 3.0
                     {
@@ -897,7 +885,7 @@ impl<E: Engine> FlowChecker<E> {
                         SCHED_THROTTLE_ACTION_COUNTER
                             .with_label_values(&[&cf, "refresh_down_flow"])
                             .inc();
-                        self.down_flow(cf);
+                        self.update_flow(cf);
                     } else {
                         SCHED_THROTTLE_ACTION_COUNTER
                             .with_label_values(&[&cf, "keep_flow"])
@@ -939,32 +927,13 @@ impl<E: Engine> FlowChecker<E> {
         }
     }
 
-    fn down_flow(&mut self, cf: String) {
-        // let ratio = if pending_compaction_bytes < soft {
-        //     0
-        // } else {
-        //     let kp = (pending_compaction_bytes - soft) / (hard - soft);
-        //     let mut kd = -10.0 * checker.long_term_pending_bytes.slope();
-
-        //     SCHED_KD_GAUGE.set(kd as i64);
-        //     SCHED_KP_GAUGE.set((kp * RATIO_PRECISION) as i64);
-
-        //     if kd > 0.1 {
-        //         kd = 0.1;
-        //     } else if kd < -0.1 {
-        //         kd = -0.1;
-        //     }
-
-        //     let new_ratio = kp; // +kd
-        //     let old_ratio = self.di
-        // }
-
+    fn update_flow(&mut self, cf: String) {
         let throttle = if self.limiter.speed_limit() == INFINITY {
             self.throttle_cf = Some(cf.clone());
             let x = self.recorder.get_percentile_95();
             if x == 0 { INFINITY } else { x as f64 }
         } else {
-            let kp = 0.25;
+            let kp = 0.15;
             let kd = 5.0;
 
             let mut u = kp
