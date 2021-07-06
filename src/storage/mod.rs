@@ -80,7 +80,8 @@ use concurrency_manager::ConcurrencyManager;
 use engine_traits::{CfName, CF_DEFAULT, DATA_CFS};
 use futures::prelude::*;
 use kvproto::kvrpcpb::{
-    CommandPri, Context, GetRequest, IsolationLevel, KeyRange, LockInfo, RawGetRequest,
+    ChecksumAlgorithm, CommandPri, Context, GetRequest, IsolationLevel, KeyRange, LockInfo,
+    RawGetRequest,
 };
 use kvproto::pdpb::QueryKind;
 use raftstore::store::util::build_key_range;
@@ -1712,6 +1713,47 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
             .collect();
         let cmd = RawAtomicStore::new(cf, muations, None, ctx);
         self.sched_txn_command(cmd, callback)
+    }
+
+    pub fn raw_checksum(
+        &self,
+        ctx: Context,
+        algorithm: ChecksumAlgorithm,
+        ranges: Vec<KeyRange>,
+    ) -> impl Future<Output = Result<(u64, u64, u64)>> {
+        let priority = ctx.get_priority();
+        let enable_ttl = self.enable_ttl;
+
+        let res = self.read_pool.spawn_handle(
+            async move {
+                if algorithm != ChecksumAlgorithm::Crc64Xor {
+                    return Err(box_err!("unknown checksum algorithm {:?}", algorithm));
+                }
+
+                let snap_ctx = SnapContext {
+                    pb_ctx: &ctx,
+                    ..Default::default()
+                };
+                let snapshot =
+                    Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await?;
+                let begin_instant = tikv_util::time::Instant::now_coarse();
+                let ret = if enable_ttl {
+                    let snap = TTLSnapshot::from(snapshot);
+                    raw::raw_checksum_ranges(snap, ranges).await
+                } else {
+                    raw::raw_checksum_ranges(snapshot, ranges).await
+                };
+
+                ret
+            },
+            priority,
+            thread_rng().next_u64(),
+        );
+
+        async move {
+            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
+                .await?
+        }
     }
 }
 

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use engine_traits::util::append_expire_ts;
 use futures::executor::ThreadPool;
 use kvproto::backup::StorageBackend;
 #[cfg(feature = "prost-codec")]
@@ -28,7 +29,7 @@ use engine_traits::{
     SeekKey, SstExt, SstReader, SstWriter, SstWriterBuilder, CF_DEFAULT, CF_WRITE,
 };
 use file_system::{get_io_rate_limiter, sync_dir, File, OpenOptions};
-use tikv_util::time::Limiter;
+use tikv_util::time::{Limiter, UnixSecs};
 use txn_types::{is_short_value, Key, TimeStamp, Write as KvWrite, WriteRef, WriteType};
 
 use super::Config;
@@ -441,6 +442,26 @@ impl SSTImporter {
             self.key_manager.clone(),
         ))
     }
+
+    pub fn new_raw_writer<E: KvEngine>(
+        &self,
+        db: &E,
+        mut meta: SstMeta,
+    ) -> Result<RawSSTWriter<E>> {
+        meta.set_cf_name(CF_DEFAULT.to_owned());
+        let default_path = self.dir.join(&meta)?;
+        let default = E::SstWriterBuilder::new()
+            .set_db(&db)
+            .set_cf(CF_DEFAULT)
+            .build(default_path.temp.to_str().unwrap())
+            .unwrap();
+        Ok(RawSSTWriter::new(
+            default,
+            default_path,
+            meta,
+            self.key_manager.clone(),
+        ))
+    }
 }
 
 pub struct SSTWriter<E: KvEngine> {
@@ -513,12 +534,12 @@ impl<E: KvEngine> SSTWriter<E> {
         let (w1, w2, key_manager) = (self.default, self.write, self.key_manager);
         if default_entries > 0 {
             w1.finish()?;
-            Self::save(p1, key_manager.as_deref())?;
+            p1.save(key_manager.as_deref())?;
             metas.push(default_meta);
         }
         if write_entries > 0 {
             w2.finish()?;
-            Self::save(p2, key_manager.as_deref())?;
+            p2.save(key_manager.as_deref())?;
             metas.push(write_meta);
         }
         info!("finish write to sst";
@@ -527,26 +548,74 @@ impl<E: KvEngine> SSTWriter<E> {
         );
         Ok(metas)
     }
+}
 
-    // move file from temp to save.
-    fn save(mut import_path: ImportPath, key_manager: Option<&DataKeyManager>) -> Result<()> {
-        file_system::rename(&import_path.temp, &import_path.save)?;
-        if let Some(key_manager) = key_manager {
-            let temp_str = import_path
-                .temp
-                .to_str()
-                .ok_or_else(|| Error::InvalidSSTPath(import_path.temp.clone()))?;
-            let save_str = import_path
-                .save
-                .to_str()
-                .ok_or_else(|| Error::InvalidSSTPath(import_path.save.clone()))?;
-            key_manager.link_file(temp_str, save_str)?;
-            key_manager.delete_file(temp_str)?;
+pub fn current_ts() -> u64 {
+    UnixSecs::now().into_inner()
+}
+
+pub fn convert_to_expire_ts(ttl: u64) -> u64 {
+    if ttl == 0 {
+        return 0;
+    }
+    ttl.saturating_add(current_ts())
+}
+
+pub struct RawSSTWriter<E: KvEngine> {
+    default: E::SstWriter,
+    default_entries: u64,
+    default_path: ImportPath,
+    default_meta: SstMeta,
+    key_manager: Option<Arc<DataKeyManager>>,
+}
+
+impl<E: KvEngine> RawSSTWriter<E> {
+    pub fn new(
+        default: E::SstWriter,
+        default_path: ImportPath,
+        default_meta: SstMeta,
+        key_manager: Option<Arc<DataKeyManager>>,
+    ) -> Self {
+        RawSSTWriter {
+            default,
+            default_path,
+            default_entries: 0,
+            default_meta,
+            key_manager,
         }
-        // sync the directory after rename
-        import_path.save.pop();
-        sync_dir(&import_path.save)?;
+    }
+
+    fn put(&mut self, key: &[u8], value: &[u8], op: PairOp) -> Result<()> {
+        let k = keys::data_key(key);
+        match op {
+            PairOp::Delete => self.default.delete(&k)?,
+            PairOp::Put => {
+                self.default.put(&k, value)?;
+                self.default_entries += 1;
+            }
+        }
         Ok(())
+    }
+
+    pub fn write(&mut self, mut batch: RawWriteBatch) -> Result<()> {
+        let ttl = batch.get_ttl();
+        let expire_ts = convert_to_expire_ts(ttl);
+        for mut m in batch.take_pairs().into_iter() {
+            let mut value = m.take_value();
+            append_expire_ts(&mut value, expire_ts);
+            self.put(m.get_key(), &value, m.get_op())?;
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<Vec<SstMeta>> {
+        if self.default_entries > 0 {
+            self.default.finish()?;
+            self.default_path.save(self.key_manager.as_deref())?;
+            info!("finish write to sst"; "default entries" => self.default_entries);
+            return Ok(vec![self.default_meta]);
+        }
+        Ok(vec![])
     }
 }
 
@@ -720,6 +789,30 @@ impl fmt::Debug for ImportPath {
             .finish()
     }
 }
+
+impl ImportPath {
+    // move file from temp to save.
+    pub fn save(mut self, key_manager: Option<&DataKeyManager>) -> Result<()> {
+        file_system::rename(&self.temp, &self.save)?;
+        if let Some(key_manager) = key_manager {
+            let temp_str = self
+                .temp
+                .to_str()
+                .ok_or_else(|| Error::InvalidSSTPath(self.temp.clone()))?;
+            let save_str = self
+                .save
+                .to_str()
+                .ok_or_else(|| Error::InvalidSSTPath(self.save.clone()))?;
+            key_manager.link_file(temp_str, save_str)?;
+            key_manager.delete_file(temp_str)?;
+        }
+        // sync the directory after rename
+        self.save.pop();
+        sync_dir(&self.save)?;
+        Ok(())
+    }
+}
+
 // `SyncableWrite` extends io::Write with sync
 trait SyncableWrite: io::Write + Send {
     // sync all metadata to storage
