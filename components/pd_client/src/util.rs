@@ -628,7 +628,11 @@ impl PdConnector {
         match res {
             Some((client, target_url)) => {
                 let info = TargetInfo::new(target_url, "");
-                let tso = TimestampOracle::new(resp.get_header().get_cluster_id(), &client)?;
+                let tso = TimestampOracle::new(
+                    resp.get_header().get_cluster_id(),
+                    &client,
+                    info.call_option(),
+                )?;
                 return Ok(Some((client, info, resp, tso)));
             }
             None => {
@@ -639,8 +643,11 @@ impl PdConnector {
                 }
                 if enable_forwarding && has_network_error {
                     if let Ok(Some((client, info))) = self.try_forward(members, leader).await {
-                        let tso =
-                            TimestampOracle::new(resp.get_header().get_cluster_id(), &client)?;
+                        let tso = TimestampOracle::new(
+                            resp.get_header().get_cluster_id(),
+                            &client,
+                            info.call_option(),
+                        )?;
                         return Ok(Some((client, info, resp, tso)));
                     }
                 }

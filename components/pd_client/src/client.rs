@@ -162,7 +162,7 @@ impl RpcClient {
 
     /// Creates a new call option with default request timeout.
     #[inline]
-    fn call_option(client: &Client) -> CallOption {
+    pub fn call_option(client: &Client) -> CallOption {
         client
             .inner
             .rl()
@@ -871,6 +871,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore]
     fn test_many_tso() {
         let pool = yatp::Builder::new("test")
             .max_thread_count(1)

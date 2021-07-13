@@ -19,7 +19,7 @@ use futures::{
     prelude::*,
     task::{AtomicWaker, Context, Poll},
 };
-use grpcio::WriteFlags;
+use grpcio::{CallOption, WriteFlags};
 use kvproto::pdpb::{PdClient, TsoRequest, TsoResponse};
 use std::{cell::RefCell, collections::VecDeque, pin::Pin, rc::Rc, thread};
 use tikv_util::{box_err, info};
@@ -46,10 +46,13 @@ pub struct TimestampOracle {
 }
 
 impl TimestampOracle {
-    pub(crate) fn new(cluster_id: u64, pd_client: &PdClient) -> Result<TimestampOracle> {
+    pub(crate) fn new(
+        cluster_id: u64,
+        pd_client: &PdClient,
+        call_option: CallOption,
+    ) -> Result<TimestampOracle> {
         let (request_tx, request_rx) = mpsc::channel(MAX_BATCH_SIZE);
-        // FIXME: use tso_opt
-        let (rpc_sender, rpc_receiver) = pd_client.tso()?;
+        let (rpc_sender, rpc_receiver) = pd_client.tso_opt(call_option)?;
 
         // Start a background thread to handle TSO requests and responses
         thread::spawn(move || {
@@ -115,14 +118,11 @@ async fn run_tso(
 
             allocate_timestamps(&resp, &mut pending_requests)?;
         }
-        // TODO: distinguish between unexpected stream termination and expected end of test
-        info!("TSO stream terminated");
         Ok(())
     };
 
     let (send_res, recv_res): (_, Result<()>) = join!(send_requests, receive_and_handle_responses);
-    info!("TSO send termination: {:?}", send_res);
-    info!("TSO receive termination: {:?}", recv_res);
+    info!("TSO worker terminated"; "cause" => ?[send_res, recv_res]);
 }
 
 struct RequestGroup {
@@ -196,9 +196,7 @@ fn allocate_timestamps(
     }) = pending_requests.pop_front()
     {
         if tso_request.count != offset {
-            return Err(box_err!(
-                "PD gives different number of timestamps than expected"
-            ));
+            return Err(box_err!("PD gives expected number of timestamps"));
         }
 
         for request in requests {
