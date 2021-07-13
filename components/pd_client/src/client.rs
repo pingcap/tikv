@@ -1,9 +1,15 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::fmt;
+<<<<<<< HEAD
 use std::sync::{Arc, RwLock};
 use std::thread;
+=======
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+>>>>>>> 5cf7d1f2a... support monitoring pending pd heartbeat (#10000)
 use std::time::{Duration, Instant};
+use std::u64;
 
 use futures::sync::mpsc;
 use futures::sync::oneshot;
@@ -404,6 +410,7 @@ impl PdClient for RpcClient {
         interval.set_end_timestamp(UnixSecs::now().into_inner());
         req.set_interval(interval);
 
+<<<<<<< HEAD
         let executor = |client: &RwLock<Inner>, req: pdpb::RegionHeartbeatRequest| {
             let mut inner = client.wl();
             if let Either::Right(ref sender) = inner.hb_sender {
@@ -430,6 +437,39 @@ impl PdClient for RpcClient {
                     }))
                     .then(|result| match result {
                         Ok((mut sender, _)) => {
+=======
+        let executor = |client: &Client, req: pdpb::RegionHeartbeatRequest| {
+            let mut inner = client.inner.wl();
+            if let Either::Left(ref mut left) = inner.hb_sender {
+                debug!("heartbeat sender is refreshed");
+                let sender = left.take().expect("expect region heartbeat sink");
+                let (tx, rx) = mpsc::unbounded();
+                let pending_heartbeat = Arc::new(AtomicU64::new(0));
+                inner.hb_sender = Either::Right(tx);
+                inner.pending_heartbeat = pending_heartbeat.clone();
+                inner.client_stub.spawn(async move {
+                    let mut sender = sender.sink_map_err(Error::Grpc);
+                    let mut last_report = u64::MAX;
+                    let result = sender
+                        .send_all(&mut rx.map(|r| {
+                            let last = pending_heartbeat.fetch_sub(1, Ordering::Relaxed);
+                            // Sender will update pending at every send operation, so as long as
+                            // pending task is increasing, pending count should be reported by
+                            // sender.
+                            if last + 10 < last_report || last == 1 {
+                                PD_PENDING_HEARTBEAT_GAUGE.set(last as i64 - 1);
+                                last_report = last;
+                            }
+                            if last > last_report {
+                                last_report = last - 1;
+                            }
+                            Ok((r, WriteFlags::default()))
+                        }))
+                        .await;
+                    match result {
+                        Ok(()) => {
+                            sender.get_mut().cancel();
+>>>>>>> 5cf7d1f2a... support monitoring pending pd heartbeat (#10000)
                             info!("cancel region heartbeat sender");
                             sender.get_mut().cancel();
                             Ok(())
@@ -438,8 +478,26 @@ impl PdClient for RpcClient {
                             error!(?e; "failed to send heartbeat");
                             Err(e)
                         }
+<<<<<<< HEAD
                     }),
             ) as PdFuture<_>
+=======
+                    };
+                });
+            }
+
+            let last = inner.pending_heartbeat.fetch_add(1, Ordering::Relaxed);
+            PD_PENDING_HEARTBEAT_GAUGE.set(last as i64 + 1);
+            let sender = inner
+                .hb_sender
+                .as_mut()
+                .right()
+                .expect("expect region heartbeat sender");
+            let ret = sender
+                .unbounded_send(req)
+                .map_err(|e| Error::Other(Box::new(e)));
+            Box::pin(future::ready(ret)) as PdFuture<_>
+>>>>>>> 5cf7d1f2a... support monitoring pending pd heartbeat (#10000)
         };
 
         self.leader_client

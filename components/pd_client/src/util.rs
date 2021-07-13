@@ -1,6 +1,11 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
+<<<<<<< HEAD
 use std::result;
+=======
+use std::pin::Pin;
+use std::sync::atomic::AtomicU64;
+>>>>>>> 5cf7d1f2a... support monitoring pending pd heartbeat (#10000)
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::thread;
@@ -40,6 +45,7 @@ pub struct Inner {
     members: GetMembersResponse,
     security_mgr: Arc<SecurityManager>,
     on_reconnect: Option<Box<dyn Fn() + Sync + Send + 'static>>,
+    pub pending_heartbeat: Arc<AtomicU64>,
 
     last_try_reconnect: Instant,
 }
@@ -109,6 +115,30 @@ impl LeaderClient {
                 members,
                 security_mgr,
                 on_reconnect: None,
+<<<<<<< HEAD
+=======
+                pending_heartbeat: Arc::default(),
+                last_try_reconnect: Instant::now(),
+            }),
+            feature_gate: FeatureGate::default(),
+            enable_forwarding,
+        }
+    }
+
+    pub fn update_client(
+        &self,
+        client_stub: PdClientStub,
+        target: TargetInfo,
+        members: GetMembersResponse,
+    ) {
+        let start_refresh = Instant::now();
+        let mut inner = self.inner.wl();
+
+        let (tx, rx) = client_stub
+            .region_heartbeat_opt(target.call_option())
+            .unwrap_or_else(|e| panic!("fail to request PD {} err {:?}", "region_heartbeat", e));
+        info!("heartbeat sender and receiver are stale, refreshing ...");
+>>>>>>> 5cf7d1f2a... support monitoring pending pd heartbeat (#10000)
 
                 last_try_reconnect: Instant::now(),
             })),
