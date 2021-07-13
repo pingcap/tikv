@@ -13,13 +13,11 @@ use std::path::Path;
 impl ImportExt for RocksEngine {
     type IngestExternalFileOptions = RocksIngestExternalFileOptions;
 
-    fn ingest_external_file_cf(
-        &self,
-        cf: &str,
-        opts: &Self::IngestExternalFileOptions,
-        files: &[&str],
-    ) -> Result<()> {
+    fn ingest_external_file_cf(&self, cf: &str, files: &[&str]) -> Result<()> {
         let cf = util::get_cf_handle(self.as_inner(), cf)?;
+        let mut opts = RocksIngestExternalFileOptions::new();
+        opts.move_files(true);
+        opts.set_write_global_seqno(false);
         // This is calling a specially optimized version of
         // ingest_external_file_cf. In cases where the memtable needs to be
         // flushed it avoids blocking writers while doing the flush. The unused
@@ -54,5 +52,13 @@ impl IngestExternalFileOptions for RocksIngestExternalFileOptions {
 
     fn move_files(&mut self, f: bool) {
         self.0.move_files(f);
+    }
+
+    fn get_write_global_seqno(&self) -> bool {
+        self.0.get_write_global_seqno()
+    }
+
+    fn set_write_global_seqno(&mut self, f: bool) {
+        self.0.set_write_global_seqno(f);
     }
 }

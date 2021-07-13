@@ -597,7 +597,9 @@ impl Snapshot {
             }
 
             if !plain_file_used(cf_file.cf) {
-                // Reset global seq number.
+                // TODO: remove reset_global_seq() if possible. TiKV does not write global_seqno
+                // into to-be-ingested SST files by default, this is only kept for backward
+                // compatibility.
                 engine.reset_global_seq(&cf_file.cf, &cf_file.path)?;
             }
             check_file_size_and_checksum(
