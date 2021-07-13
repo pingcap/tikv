@@ -127,6 +127,23 @@ impl RpcClient {
                     // is not a major issue.
                     rpc_client.monitor.spawn(update_loop);
 
+                    let client = Arc::downgrade(&rpc_client.pd_client);
+                    let tso_check = async move {
+                        while let Some(cli) = client.upgrade() {
+                            let _ = GLOBAL_TIMER_HANDLE
+                                .delay(Instant::now() + duration)
+                                .compat()
+                                .await;
+                            let closed_fut = cli.inner.rl().tso.closed();
+                            closed_fut.await;
+                            info!("TSO stream is closed, reconnect to PD");
+                            if let Err(e) = cli.reconnect(true).await {
+                                warn!("failed to update PD client"; "error"=> ?e);
+                            }
+                        }
+                    };
+                    rpc_client.monitor.spawn(tso_check);
+
                     return Ok(rpc_client);
                 }
                 Err(e) => {

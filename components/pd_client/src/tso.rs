@@ -83,6 +83,11 @@ impl TimestampOracle {
                 .map_err(|_| box_err!("Timestamp channel is dropped"))
         }
     }
+
+    pub(crate) fn closed(&self) -> impl Future<Output = ()> {
+        let request_tx = self.request_tx.clone();
+        async move { request_tx.closed().await }
+    }
 }
 
 async fn run_tso(
