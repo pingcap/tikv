@@ -11,8 +11,8 @@ use futures::compat::Future01CompatExt;
 use futures::executor::block_on;
 use futures::future::{self, BoxFuture, FutureExt, TryFutureExt};
 use futures::sink::SinkExt;
-use futures::stream::{StreamExt, TryStreamExt};
-use grpcio::{CallOption, EnvBuilder, Environment, Result as GrpcResult, WriteFlags};
+use futures::stream::StreamExt;
+use grpcio::{CallOption, EnvBuilder, Environment, WriteFlags};
 
 use kvproto::metapb;
 use kvproto::pdpb::{self, Member};
@@ -76,15 +76,17 @@ impl RpcClient {
         let pd_connector = PdConnector::new(env.clone(), security_mgr.clone());
         for i in 0..retries {
             match pd_connector.validate_endpoints(cfg).await {
-                Ok((client, target, members)) => {
+                Ok((client, target, members, tso)) => {
+                    let cluster_id = members.get_header().get_cluster_id();
                     let rpc_client = RpcClient {
-                        cluster_id: members.get_header().get_cluster_id(),
+                        cluster_id,
                         pd_client: Arc::new(Client::new(
                             Arc::clone(&env),
-                            security_mgr,
+                            security_mgr.clone(),
                             client,
                             members,
                             target,
+                            tso,
                             cfg.enable_forwarding,
                         )),
                         monitor: monitor.clone(),
@@ -125,6 +127,23 @@ impl RpcClient {
                     // is not a major issue.
                     rpc_client.monitor.spawn(update_loop);
 
+                    let client = Arc::downgrade(&rpc_client.pd_client);
+                    let tso_check = async move {
+                        while let Some(cli) = client.upgrade() {
+                            let _ = GLOBAL_TIMER_HANDLE
+                                .delay(Instant::now() + duration)
+                                .compat()
+                                .await;
+                            let closed_fut = cli.inner.rl().tso.closed();
+                            closed_fut.await;
+                            info!("TSO stream is closed, reconnect to PD");
+                            if let Err(e) = cli.reconnect(true).await {
+                                warn!("failed to update PD client"; "error"=> ?e);
+                            }
+                        }
+                    };
+                    rpc_client.monitor.spawn(tso_check);
+
                     return Ok(rpc_client);
                 }
                 Err(e) => {
@@ -160,7 +179,7 @@ impl RpcClient {
 
     /// Creates a new call option with default request timeout.
     #[inline]
-    fn call_option(client: &Client) -> CallOption {
+    pub fn call_option(client: &Client) -> CallOption {
         client
             .inner
             .rl()
@@ -794,48 +813,21 @@ impl PdClient for RpcClient {
 
         Ok(resp)
     }
-    // TODO: The current implementation is not efficient, because it creates
-    //       a RPC for every `PdFuture<TimeStamp>`. As a duplex streaming RPC,
-    //       we could use one RPC for many `PdFuture<TimeStamp>`.
+
     fn get_tso(&self) -> PdFuture<TimeStamp> {
-        let timer = Instant::now();
-        let mut req = pdpb::TsoRequest::default();
-        req.set_count(1);
-        req.set_header(self.header());
-
-        let executor = move |client: &Client, req: pdpb::TsoRequest| {
-            let cli = client.inner.rl();
-            // The reason why we use the call option with the timeout is
-            // the tso stream is used in a unary way.
-            let (mut req_sink, mut resp_stream) = cli
-                .client_stub
-                .tso_opt(Self::call_option(client))
-                .unwrap_or_else(|e| panic!("fail to request PD {} err {:?}", "tso", e));
-            let send_once = async move {
-                req_sink.send((req, WriteFlags::default())).await?;
-                req_sink.close().await?;
-                GrpcResult::Ok(())
-            }
-            .map(|_| ());
-            cli.client_stub.spawn(send_once);
-            Box::pin(async move {
-                let resp = resp_stream.try_next().await?;
-                let resp = match resp {
-                    Some(r) => r,
-                    None => return Ok(TimeStamp::zero()),
-                };
-                PD_REQUEST_HISTOGRAM_VEC
-                    .with_label_values(&["tso"])
-                    .observe(duration_to_sec(timer.elapsed()));
-                check_resp_header(resp.get_header())?;
-                let ts = resp.get_timestamp();
-                let encoded = TimeStamp::compose(ts.physical as _, ts.logical as _);
-                Ok(encoded)
-            }) as PdFuture<_>
-        };
-
+        let begin = Instant::now();
         self.pd_client
-            .request(req, executor, LEADER_CHANGE_RETRY)
+            .request(
+                (),
+                move |client, _| {
+                    Box::pin(client.inner.rl().tso.get_timestamp().inspect_ok(move |_| {
+                        PD_REQUEST_HISTOGRAM_VEC
+                            .with_label_values(&["tso"])
+                            .observe(duration_to_sec(begin.elapsed()))
+                    }))
+                },
+                LEADER_CHANGE_RETRY,
+            )
             .execute()
     }
 
