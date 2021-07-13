@@ -797,50 +797,21 @@ impl PdClient for RpcClient {
         Ok(resp)
     }
 
-    // TODO: The current implementation is not efficient, because it creates
-    //       a RPC for every `PdFuture<TimeStamp>`. As a duplex streaming RPC,
-    //       we could use one RPC for many `PdFuture<TimeStamp>`.
     fn get_tso(&self) -> PdFuture<TimeStamp> {
-        // let timer = Instant::now();
-        // let mut req = pdpb::TsoRequest::default();
-        // req.set_count(1);
-        // req.set_header(self.header());
-
-        // let executor = move |client: &Client, req: pdpb::TsoRequest| {
-        //     let cli = client.inner.rl();
-        //     // The reason why we use the call option with the timeout is
-        //     // the tso stream is used in a unary way.
-        //     let (mut req_sink, mut resp_stream) = cli
-        //         .client_stub
-        //         .tso_opt(Self::call_option(client))
-        //         .unwrap_or_else(|e| panic!("fail to request PD {} err {:?}", "tso", e));
-        //     let send_once = async move {
-        //         req_sink.send((req, WriteFlags::default())).await?;
-        //         req_sink.close().await?;
-        //         GrpcResult::Ok(())
-        //     }
-        //     .map(|_| ());
-        //     cli.client_stub.spawn(send_once);
-        //     Box::pin(async move {
-        //         let resp = resp_stream.try_next().await?;
-        //         let resp = match resp {
-        //             Some(r) => r,
-        //             None => return Ok(TimeStamp::zero()),
-        //         };
-        //         PD_REQUEST_HISTOGRAM_VEC
-        //             .with_label_values(&["tso"])
-        //             .observe(duration_to_sec(timer.elapsed()));
-        //         check_resp_header(resp.get_header())?;
-        //         let ts = resp.get_timestamp();
-        //         let encoded = TimeStamp::compose(ts.physical as _, ts.logical as _);
-        //         Ok(encoded)
-        //     }) as PdFuture<_>
-        // };
-
-        // self.pd_client
-        //     .request(req, executor, LEADER_CHANGE_RETRY)
-        //     .execute()
-        Box::pin(self.pd_client.inner.rl().tso.get_timestamp())
+        let begin = Instant::now();
+        self.pd_client
+            .request(
+                (),
+                move |client, _| {
+                    Box::pin(client.inner.rl().tso.get_timestamp().inspect_ok(move |_| {
+                        PD_REQUEST_HISTOGRAM_VEC
+                            .with_label_values(&["tso"])
+                            .observe(duration_to_sec(begin.elapsed()))
+                    }))
+                },
+                LEADER_CHANGE_RETRY,
+            )
+            .execute()
     }
 
     fn feature_gate(&self) -> &FeatureGate {
@@ -863,38 +834,5 @@ impl DummyPdClient {
 impl PdClient for DummyPdClient {
     fn get_tso(&self) -> PdFuture<TimeStamp> {
         Box::pin(future::ok(self.next_ts))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[ignore]
-    fn test_many_tso() {
-        let pool = yatp::Builder::new("test")
-            .max_thread_count(1)
-            .build_future_pool();
-        let cfg = Config::default();
-        let mgr = Arc::new(SecurityManager::default());
-        let client = RpcClient::new(&cfg, None, mgr).unwrap();
-        for _ in 0..100 {
-            let (tx, rx) = std::sync::mpsc::channel();
-            for _ in 0..100000 {
-                let fut = client.get_tso();
-                let tx = tx.clone();
-                pool.spawn(async move {
-                    fut.await.unwrap();
-                    tx.send(()).unwrap();
-                });
-            }
-            let begin = std::time::Instant::now();
-            for _ in 0..100000 {
-                rx.recv().unwrap();
-            }
-            println!("{:?}", begin.elapsed());
-            std::thread::sleep(Duration::from_secs(1));
-        }
     }
 }

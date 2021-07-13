@@ -55,14 +55,17 @@ impl TimestampOracle {
         let (rpc_sender, rpc_receiver) = pd_client.tso_opt(call_option)?;
 
         // Start a background thread to handle TSO requests and responses
-        thread::spawn(move || {
-            block_on(run_tso(
-                cluster_id,
-                rpc_sender.sink_err_into(),
-                rpc_receiver.err_into(),
-                request_rx,
-            ))
-        });
+        thread::Builder::new()
+            .name("tso-worker".into())
+            .spawn(move || {
+                block_on(run_tso(
+                    cluster_id,
+                    rpc_sender.sink_err_into(),
+                    rpc_receiver.err_into(),
+                    request_rx,
+                ))
+            })
+            .expect("unable to create tso worker thread");
 
         Ok(TimestampOracle { request_tx })
     }
@@ -122,7 +125,7 @@ async fn run_tso(
     };
 
     let (send_res, recv_res): (_, Result<()>) = join!(send_requests, receive_and_handle_responses);
-    info!("TSO worker terminated"; "cause" => ?[send_res, recv_res]);
+    info!("TSO worker terminated"; "sender_cause" => ?send_res.err(), "receiver_cause" => ?recv_res.err());
 }
 
 struct RequestGroup {
